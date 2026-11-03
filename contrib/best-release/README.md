@@ -18,3 +18,11 @@ Controlled drag/video trials informed the selection of a 20 us halt-poll cap.
 One paired video gap count regressed. Neither sustained 240 presents/s nor
 physical 240 Hz was qualified. These sources preserve a selected trade-off;
 they do not claim all-workload performance qualification.
+
+The window close-action property retains poweroff as QEMU's default and
+adds guest-cooperative powerdown and suspend. For the desktop, select
+powerdown if the guest refuses S3 (for example, SleepDisabled is enabled).
+Suspend retains RAM/GPU objects in the same process; apple-gfx migration
+is still blocked. The display's additive host window-state API marks a
+sleeping guest and restores/raises its window on wake. A successful source
+build or mock test does not qualify guest S3 or disk-state recovery.
