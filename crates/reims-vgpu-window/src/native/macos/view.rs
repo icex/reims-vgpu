@@ -430,7 +430,12 @@ impl DisplayView {
             .input
             .try_borrow()
             .map_or("", |input| input.title_suffix());
-        let title = ns_text(&format!("{}{}", self.ivars().window.title(), suffix));
+        let title = ns_text(&format!(
+            "{}{}{}",
+            self.ivars().window.title(),
+            self.ivars().window.suspended_title_suffix(),
+            suffix
+        ));
         if let Some(window) = msg::get("window", || self.window()) {
             msg::get("setTitle:", || window.setTitle(&title));
         }

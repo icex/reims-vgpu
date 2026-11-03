@@ -21,6 +21,7 @@ pub use linux::FrameSink;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
     Surface, close, cursor_changed, guest_mode_changed, host_screens, open, sdl as sdl_os,
+    suspended_changed,
 };
 #[cfg(target_os = "macos")]
 pub use macos::FrameSink;
@@ -30,5 +31,5 @@ pub(crate) use macos::sdl as sdl_os;
 pub(crate) use macos::{
     Surface, close, cursor_changed, guest_mode_changed, host_screens, input_takes, is_iso_keyboard,
     key_input_captured, launched, monitored_events, open, quit_requested, release_key_input,
-    screens_changed,
+    screens_changed, suspended_changed,
 };

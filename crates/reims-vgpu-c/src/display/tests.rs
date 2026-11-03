@@ -351,3 +351,25 @@ fn a_display_released_with_a_job_queued_dies() {
     );
     assert!(!err.contains("SURVIVED"), "{err}");
 }
+
+/// Reporting sleep on a headless display leaves guest/device state and callbacks unchanged.
+#[test]
+fn headless_window_sleep_is_a_host_only_noop() {
+    let rig = Rig::new(1);
+    let rec = Rec::new();
+    let cb = table(&rec);
+    let (status, display) = create(rig.device, &config(0, 0x5eed_c004, &cb));
+    assert_eq!(status, RVG_OK);
+    // SAFETY: the display is live until released below; this rig uses the fake platform.
+    unsafe {
+        rvg_display_set_window_suspended(display, true);
+        rvg_display_set_window_suspended(display, false);
+        rvg_display_set_window_suspended(display, false);
+        let core = (&*display).display.core();
+        assert_eq!(core.serial_num(), 0x5eed_c004);
+        assert!(core.mode_list().is_empty());
+        assert!(rec.lines().is_empty());
+        rvg_display_release(display);
+    }
+    assert_eq!(rec.wait_destroys(1).len(), 1);
+}

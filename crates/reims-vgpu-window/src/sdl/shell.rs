@@ -172,6 +172,25 @@ pub(crate) fn open(window: &Arc<Window>) {
     );
 }
 
+/// Shows the host-reported guest sleep marker; waking restores and raises the existing window.
+/// Every SDL call stays on the UI thread. The compositor ultimately decides focus policy.
+pub(crate) fn suspended_changed(id: u64, suspended: bool) {
+    with_shell(id, |shell| {
+        if shell.closed {
+            return;
+        }
+        shell.refresh_title();
+        if !suspended {
+            // SAFETY: this is a live SDL window, on SDL's UI thread.
+            unsafe {
+                SDL_ShowWindow(shell.sdl);
+                SDL_RestoreWindow(shell.sdl);
+                SDL_RaiseWindow(shell.sdl);
+            }
+        }
+    });
+}
+
 /// Window `id`'s display ended: its input lets go and it hides; SDL's window goes once its OS
 /// lets it go ([`os::close`]).
 pub(crate) fn close(id: u64) {
@@ -392,8 +411,9 @@ impl Shell {
     /// Sets the title: the window's, then what capture adds.
     fn refresh_title(&self) {
         let title = c_string(&format!(
-            "{}{}",
+            "{}{}{}",
             self.window.title(),
+            self.window.suspended_title_suffix(),
             self.input.title_suffix()
         ));
         // SAFETY: the window is SDL's, on this thread; the title is copied.

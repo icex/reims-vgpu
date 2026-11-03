@@ -405,6 +405,15 @@ impl<P: Platform> Display<P> {
         }
     }
 
+    /// Shows the host-reported guest sleep state in this display's window. Waking restores
+    /// and raises the existing window. Posts to its UI thread, waits for nothing, and changes
+    /// neither the device nor the guest. A display without a window does nothing.
+    pub fn set_window_suspended(&self, suspended: bool) {
+        if let Some(link) = &self.window {
+            link.window().set_suspended(suspended);
+        }
+    }
+
     /// Whether both are references to one display.
     pub fn ptr_eq(&self, other: &Display<P>) -> bool {
         self.inner.ptr_eq(&other.inner)

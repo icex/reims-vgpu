@@ -148,6 +148,17 @@ pub(crate) fn cursor_changed(id: u64) {
     });
 }
 
+/// Posts the host-reported guest sleep state to the main thread.
+pub(crate) fn suspended_changed(id: u64, suspended: bool) {
+    post_main(move |mtm| {
+        if sdl_windows() {
+            sdl::windows::suspended_changed(id, suspended);
+        } else {
+            shell::suspended_changed(id, suspended, mtm);
+        }
+    });
+}
+
 /// Posts the close of window `id` to the main thread.
 pub(crate) fn close(id: u64) {
     post_main(move |mtm| {

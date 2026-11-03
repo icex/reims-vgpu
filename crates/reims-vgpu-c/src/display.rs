@@ -415,6 +415,26 @@ pub unsafe extern "C" fn rvg_display_set_modes(
     })
 }
 
+/// Shows the host-reported guest sleep state in the display's window. Waking restores and
+/// raises the existing window, subject to the compositor's focus policy. Posts to the UI
+/// thread and waits for nothing. Changes neither device nor guest state. A display without
+/// a window does nothing. Calls back: never.
+///
+/// # Safety
+/// `display` is a live display handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_display_set_window_suspended(
+    display: *mut RvgDisplay,
+    suspended: bool,
+) {
+    ffi::export(|| {
+        // SAFETY: the caller's contract.
+        unsafe { live(display, "rvg_display_set_window_suspended") }
+            .display
+            .set_window_suspended(suspended);
+    })
+}
+
 /// The cursor's position; {65535, 65535} before the guest has linked the display. While the
 /// device is paused (rvg_device_pause, or a finished suspend), a display the guest has linked
 /// ends the process here. Calls back: never.

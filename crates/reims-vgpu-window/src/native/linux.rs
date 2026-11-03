@@ -43,6 +43,11 @@ pub(crate) fn cursor_changed(id: u64) {
     ui::post(move || shell::cursor_changed(id));
 }
 
+/// Posts the host-reported guest sleep state to the UI thread.
+pub(crate) fn suspended_changed(id: u64, suspended: bool) {
+    ui::post(move || shell::suspended_changed(id, suspended));
+}
+
 /// Posts the close of window `id` to the UI thread.
 pub(crate) fn close(id: u64) {
     ui::post(move || shell::close(id));

@@ -94,6 +94,8 @@ pub struct Window {
     port: u64,
     /// The window's title.
     title: String,
+    /// The host reports that the guest is sleeping; this does not control the guest.
+    suspended: AtomicBool,
     /// The config's flag.
     match_host_screen: bool,
     /// The config's chosen mode.
@@ -142,6 +144,7 @@ impl Window {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             port,
             title,
+            suspended: AtomicBool::new(false),
             match_host_screen: config.match_host_screen,
             chosen_mode: config.mode,
             chosen_ppi: config.mode_ppi,
@@ -166,6 +169,33 @@ impl Window {
     /// The window's title.
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Shows the host-reported guest sleep state in the title. Waking restores and raises the
+    /// window on its UI thread. This changes no device or guest state, and does nothing once
+    /// the window has ended. A state recorded before attach is shown when it opens.
+    pub fn set_suspended(&self, suspended: bool) {
+        if self.is_closed() {
+            return;
+        }
+        self.suspended.store(suspended, Ordering::Release);
+        if self.is_open() {
+            native::suspended_changed(self.id, suspended);
+        }
+    }
+
+    /// The sleep state last reported by the host.
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(Ordering::Acquire)
+    }
+
+    /// The title's host-reported sleep marker.
+    pub(crate) fn suspended_title_suffix(&self) -> &'static str {
+        if self.is_suspended() {
+            " — Suspended"
+        } else {
+            ""
+        }
     }
 
     /// Whether the config asked for modes and a density matching the host's screen.
@@ -336,6 +366,24 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sleep state can arrive before the native window opens and cannot mutate a closed one.
+    #[test]
+    fn suspended_window_state_survives_until_close() {
+        let w = Window::new(WindowConfig::default(), 0, title(0));
+        assert!(!w.is_suspended());
+        assert_eq!(w.suspended_title_suffix(), "");
+        w.set_suspended(true);
+        w.set_suspended(true);
+        assert!(w.is_suspended());
+        assert_eq!(w.suspended_title_suffix(), " — Suspended");
+        w.set_suspended(false);
+        assert!(!w.is_suspended());
+        w.close();
+        w.set_suspended(true);
+        assert!(!w.is_suspended());
+        assert!(w.callbacks().is_none());
+    }
 
     /// "Reims vGPU", then the port when it is not 0
     #[test]

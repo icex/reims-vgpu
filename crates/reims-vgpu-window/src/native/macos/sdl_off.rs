@@ -42,6 +42,9 @@ pub(crate) mod windows {
     /// No SDL window shows the guest's cursor.
     pub(crate) fn cursor_changed(_id: u64) {}
 
+    /// No SDL window reports guest sleep.
+    pub(crate) fn suspended_changed(_id: u64, _suspended: bool) {}
+
     /// No SDL window closes.
     pub(crate) fn close(_id: u64) {}
 

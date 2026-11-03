@@ -374,3 +374,8 @@ same. The cursor is SDL's, with an image at the screen's scale. `manual`
   wheel.
 - Fn/Globe: QEMU's USB keyboard cannot carry it.
 - HDR output.
+
+## Host-reported guest sleep
+
+- A host can mark the window Suspended without changing guest/device state; waking restores and raises the same native window, subject to compositor focus policy. `manual`
+- Sleep state recorded before the window opens is retained, and a closed window ignores later state changes. `test: handle::suspended_window_state_survives_until_close`

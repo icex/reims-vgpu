@@ -830,6 +830,25 @@ pub(crate) fn open(window: &Arc<Window>, mtm: MainThreadMarker) {
     );
 }
 
+/// Shows the host-reported sleep marker, and raises the existing window when waking.
+pub(crate) fn suspended_changed(id: u64, suspended: bool, mtm: MainThreadMarker) {
+    let found = OPEN
+        .get(mtm)
+        .borrow()
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| (s.window.clone(), s.view.clone()));
+    if let Some((window, view)) = found {
+        view.refresh_title();
+        if !suspended {
+            msg::get("deminiaturize:", || window.deminiaturize(None));
+            msg::get("makeKeyAndOrderFront:", || {
+                window.makeKeyAndOrderFront(None)
+            });
+        }
+    }
+}
+
 /// Closes window `id`, at its display's end: its input lets go, and the `NSWindow`, its view,
 /// delegate and layer are released here.
 pub(crate) fn close(id: u64, mtm: MainThreadMarker) {
