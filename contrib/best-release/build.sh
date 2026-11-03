@@ -45,3 +45,5 @@ cp qemu-system-x86_64 "$OUT/bundle/bin/"
 cp "$ROOT/vendor/qemu/scripts/reims-unix-tcp-relay.py" "$OUT/bundle/bin/"
 cc -std=c11 -Wall -Wextra -Werror "$ROOT/vendor/qemu/tests/unit/test-reims-halt-poll.c" -o "$OUT/test-halt-poll"
 "$OUT/test-halt-poll"
+
+cp -a "$ROOT/contrib/best-release/desktop" "$OUT/bundle/desktop"

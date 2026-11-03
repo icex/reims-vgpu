@@ -1,0 +1,204 @@
+#!/usr/bin/python3
+"""Desktop controls for the existing independent Reims macOS launcher."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+ROOT = Path.home() / 'reims-9070xt'
+TITLE = 'macOS (Reims / RX 9070 XT)'
+QMP_TIMEOUT = 5.0
+WAKE_TIMEOUT = 15.0
+
+
+def notify(message):
+    subprocess.run(['notify-send', '-a', TITLE, '-i', 'computer', TITLE, message], check=False)
+
+
+def state():
+    result = subprocess.run(['systemctl', '--user', 'show', 'reims-9070xt.service',
+                             '--property=ActiveState', '--value'], capture_output=True, text=True)
+    return result.stdout.strip() or 'inactive'
+
+
+def current_run():
+    run = (ROOT / 'current').resolve(strict=True)
+    if run.parent != (ROOT / 'runs').resolve() or run.stat().st_uid != os.getuid():
+        raise RuntimeError('The current Reims run is not owned by this account.')
+    return run
+
+
+class QMP:
+    """A bounded QMP connection to this account's current Reims run."""
+
+    def __init__(self, run):
+        path = run / 'qmp.sock'
+        info = path.lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError('The current run has no owned QMP socket.')
+        self.connection = socket.socket(socket.AF_UNIX)
+        self.channel = None
+        self.sequence = 0
+        try:
+            self.connection.settimeout(QMP_TIMEOUT)
+            self.connection.connect(str(path))
+            # A socket path owned by us must also connect to a peer owned by us.
+            peer = self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            _, uid, _ = struct.unpack('3i', peer)
+            if uid != os.getuid():
+                raise RuntimeError('The current run has an unexpected QMP owner.')
+            self.channel = self.connection.makefile('rwb', buffering=0)
+            greeting = self._read(time.monotonic() + QMP_TIMEOUT)
+            if not isinstance(greeting.get('QMP'), dict):
+                raise RuntimeError('The current run did not answer as QMP.')
+            self.command('qmp_capabilities')
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.channel is not None:
+            self.channel.close()
+        self.connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def _read(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError('QMP acknowledgement timed out.')
+        self.connection.settimeout(remaining)
+        line = self.channel.readline(1024 * 1024 + 1)
+        if not line:
+            raise RuntimeError('QMP closed before acknowledging the request.')
+        if len(line) > 1024 * 1024 or not line.endswith(b'\n'):
+            raise RuntimeError('QMP sent an oversized or incomplete response.')
+        reply = json.loads(line)
+        if not isinstance(reply, dict):
+            raise RuntimeError('QMP sent an invalid response.')
+        return reply
+
+    def command(self, command):
+        sequence = self.sequence
+        self.sequence += 1
+        self.connection.sendall((json.dumps({'execute': command, 'id': sequence}) + '\n').encode())
+        deadline = time.monotonic() + QMP_TIMEOUT
+        while True:
+            reply = self._read(deadline)
+            if 'event' in reply:
+                continue
+            if reply.get('id') != sequence:
+                raise RuntimeError('QMP sent an unexpected response identifier.')
+            if 'error' in reply:
+                error = reply['error']
+                raise RuntimeError('QMP refused ' + command + ': ' + str(error))
+            if 'return' not in reply:
+                raise RuntimeError('QMP response has no result.')
+            return reply['return']
+
+    def status(self):
+        result = self.command('query-status')
+        if not isinstance(result, dict) or not isinstance(result.get('status'), str):
+            raise RuntimeError('QMP returned an invalid guest status.')
+        return result['status']
+
+    def wake(self):
+        self.command('system_wakeup')
+        deadline = time.monotonic() + WAKE_TIMEOUT
+        while True:
+            status = self.status()
+            if status == 'running':
+                return
+            if status != 'suspended':
+                raise RuntimeError('macOS did not resume: QEMU state is ' + status + '.')
+            if time.monotonic() >= deadline:
+                raise RuntimeError('macOS resume timed out; no shutdown or termination was sent.')
+            time.sleep(0.1)
+
+
+def guest_state():
+    service = state()
+    if service == 'active':
+        with QMP(current_run()) as qmp:
+            return qmp.status()
+    return service
+
+
+def powerdown():
+    service = state()
+    if service not in ('active', 'activating'):
+        notify('macOS is stopped.')
+        return
+    if service == 'activating':
+        notify('macOS is starting. Wait until it has started before requesting shutdown.')
+        return
+    # Wake a sleeping guest before delivering its ordinary ACPI shutdown.
+    # Never terminate QEMU or request Linux host sleep here.
+    with QMP(current_run()) as qmp:
+        status = qmp.status()
+        if status == 'suspended':
+            qmp.wake()
+        elif status != 'running':
+            raise RuntimeError('Cannot request a clean macOS shutdown while QEMU is ' + status + '.')
+        qmp.command('system_powerdown')
+    notify('Shutdown requested. macOS will stop when it finishes shutting down.')
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else 'start'
+    if action == 'status':
+        settings = json.loads((ROOT / 'desktop-settings.json').read_text())
+        message = f"{guest_state()} — saved build: {settings.get('channel', 'stable')}"
+        print(message)
+        if '--notify' in sys.argv:
+            notify(message)
+    elif action == 'usb':
+        if state() != 'active':
+            raise RuntimeError('Start macOS before selecting USB devices.')
+        os.execv(str(ROOT / 'reims-usb-picker.sh'), [str(ROOT / 'reims-usb-picker.sh')])
+    elif action == 'stop':
+        powerdown()
+    elif action == 'start':
+        service = state()
+        if service == 'activating':
+            notify('macOS is already starting.')
+            return
+        if service == 'active':
+            with QMP(current_run()) as qmp:
+                status = qmp.status()
+                if status == 'suspended':
+                    qmp.wake()
+                    notify('macOS resumed.')
+                else:
+                    notify('macOS is already running (QEMU state: ' + status + ').')
+            return
+        with open('/var/tmp/reims-host-workload.lock', 'a') as lease:
+            try:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('A coordinated build or performance test is running. Try again when it finishes.')
+            result = subprocess.run(['/usr/bin/python3', str(ROOT / 'launch.py')], capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip()[-600:] or 'The existing Reims launcher failed.')
+        notify('macOS is starting using the saved Reims build and display settings.')
+    else:
+        raise RuntimeError('Usage: reims-macos [start|stop|status [--notify]|usb]')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError) as error:
+        print(str(error), file=sys.stderr)
+        notify(str(error))
+        sys.exit(1)
