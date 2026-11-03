@@ -5,11 +5,12 @@
 //! Two kinds of entry:
 //! - **Registrations** of memory the library does not map itself: the guest's RAM, a shared
 //!   mapping of the files the host names in its memory map (the `guest_memory` lease of the
-//!   memory map's device), and the memory of IOSurface's stand-in. One registered again over the
-//!   same descriptor and offset is counted, and goes with the last. The C API duplicates the
-//!   host's descriptors for each device it makes, so devices over the same RAM register it each
-//!   under its own: a byte resolves through the first registration that holds it, and every one
-//!   shows the same file pages.
+//!   memory map's device), and the memory of IOSurface's stand-in, a memfd's, or under
+//!   `REIMS_VGPU_VRAM_SURFACES` a dma-buf of device memory's ([`super::vram`]). One registered
+//!   again over the same descriptor and offset is counted, and goes with the last. The C API
+//!   duplicates the host's descriptors for each device it makes, so devices over the same RAM
+//!   register it each under its own: a byte resolves through the first registration that holds
+//!   it, and every one shows the same file pages.
 //! - **Runs** the library mapped: every view [`super::vm::LinuxVm`] made, and every range of
 //!   [`super::vm::allocate_aliasable`]. A run shows `end - first` bytes of its file from its
 //!   offset, with the protection last set on it. Runs never overlap: a new run replaces what of
@@ -55,13 +56,15 @@ struct Run {
     prot: i32,
 }
 
-/// A registration: `first..end` shows `backing`, read and write, `count` times registered.
+/// A registration: `first..end` shows `backing`, read and write, `count` times registered, and
+/// whether it is the guest's RAM (a lease's, [`lease_guest_memory`]).
 #[derive(Debug)]
 struct Registered {
     first: u64,
     end: u64,
     backing: Backing,
     count: usize,
+    guest_ram: bool,
 }
 
 /// One piece of a range as the table resolves it: `length` bytes, `at` bytes into the range,
@@ -92,7 +95,8 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 
 /// Whether the kernel holds the run `a` from `a_first` and the run `b` from `b_first` as one
 /// mapping: `b` starts where `a` ends, in the same file at the offset `a` ends at, with the same
-/// protection (module docs).
+/// protection (module docs). The kernel merges no mappings of a dma-buf of device memory
+/// (`VM_PFNMAP`), which only a registration holds, as no view is made of a backing.
 fn joined(a_first: u64, a: &Run, b_first: u64, b: &Run) -> bool {
     a.end == b_first
         && Arc::ptr_eq(&a.backing.fd, &b.backing.fd)
@@ -279,6 +283,12 @@ pub(crate) fn readable(first: u64, length: u64) -> Option<bool> {
     Some(pieces.iter().all(|p| p.prot & libc::PROT_READ != 0))
 }
 
+/// Whether `fd` is a file of the guest's RAM a lease registered ([`lease_guest_memory`]).
+pub(crate) fn guest_ram(fd: &Arc<OwnedFd>) -> bool {
+    let table = TABLE.lock();
+    (table.registered.iter()).any(|r| r.guest_ram && Arc::ptr_eq(&r.backing.fd, fd))
+}
+
 /// Whether a byte of `length` bytes from `first` lies in a registration.
 pub(crate) fn meets_registration(first: u64, length: u64) -> bool {
     let end = first.saturating_add(length);
@@ -302,6 +312,11 @@ impl Registration {
     /// Registers `length` bytes from `first` as showing `backing`: counted again where the same
     /// bytes are registered over the same file and offset.
     pub(crate) fn new(first: u64, length: u64, backing: Backing) -> Registration {
+        Registration::made(first, length, backing, false)
+    }
+
+    /// [`Registration::new`], of the guest's RAM where `guest_ram` says so.
+    fn made(first: u64, length: u64, backing: Backing, guest_ram: bool) -> Registration {
         let end = first.saturating_add(length);
         let mut table = TABLE.lock();
         match table
@@ -315,6 +330,7 @@ impl Registration {
                 end,
                 backing: backing.clone(),
                 count: 1,
+                guest_ram,
             }),
         }
         Registration {
@@ -327,10 +343,17 @@ impl Registration {
 
 /// The guest's RAM registered while a device made over it lives: the `guest_memory` lease its
 /// device holds, made of the host's memory map, and dropped after core's teardown. Views of the
-/// guest's pages are made of these files.
+/// guest's pages are made of these files. Its drop lets the kept dma-bufs of windows of the
+/// guest's RAM go ([`super::dma_buf::forget_kept`]), so no file outlives its device in them.
 #[derive(Debug)]
 pub struct GuestMemoryLease {
     _registrations: Vec<Registration>,
+}
+
+impl Drop for GuestMemoryLease {
+    fn drop(&mut self) {
+        super::dma_buf::forget_kept();
+    }
 }
 
 /// Registers each range of the guest's RAM the host names a file behind: counted where the same
@@ -344,7 +367,7 @@ pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> Gue
                 fd: r.fd,
                 offset: r.offset,
             };
-            Registration::new(r.host, r.length, backing)
+            Registration::made(r.host, r.length, backing, true)
         })
         .collect();
     let guest_ram = registrations

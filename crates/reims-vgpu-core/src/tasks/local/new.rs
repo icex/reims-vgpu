@@ -13,6 +13,7 @@ use crate::deserializer::Deserializer;
 use crate::device::DeviceCore;
 use crate::guest::GuestPtr;
 use crate::guest::records::APV_PAGE_SHIFT;
+use crate::memory::kept::KeptMappings;
 use crate::memory::page_table::{INDEX_BITS, PageTableRead, PageTableWalker, host_error_log};
 use crate::memory::tracker::RangeTracker;
 use crate::platform::Platform;
@@ -145,6 +146,7 @@ impl<P: Platform> LocalTask<P> {
             io_surface_buffers_allowed: false,
             prepare_mutex: Mutex::new(()),
             object_list_range: Mutex::new((0, 0)),
+            kept: KeptMappings::new(),
         };
         if length == 0 {
             log::warn!("task {task_id} refused: its length is 0");
@@ -271,15 +273,17 @@ impl<P: Platform> LocalTask<P> {
                 // Each read loads the device weakly: nothing once its teardown has begun, else a
                 // strong reference held to the end of the read's hold's holder (`Hold::keep`), so
                 // a last host release mid-walk tears the device down at that holder's end, after the
-                // walking work, never inside the walk (lessons.md: weak loads)
-                let Some((d, handle)) = device
-                    .upgrade()
-                    .and_then(|d| d.retain_self().map(|handle| (d, handle)))
-                else {
+                // walking work, never inside the walk (lessons.md: weak loads). A holder that holds
+                // one already takes no other: the device's teardown cannot begin while it is held,
+                // and the first one held is the last of them released
+                let Some(d) = device.upgrade() else {
                     // Nothing read and `false`, which the walker ignores.
                     return Ok(false);
                 };
-                hold.keep(handle);
+                let key = Arc::as_ptr(&d).addr();
+                if !hold.keep_once(key, || d.retain_self()) {
+                    return Ok(false);
+                }
                 d.read_from_physical_address(on, address, dst)
             },
         );

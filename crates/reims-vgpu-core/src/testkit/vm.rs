@@ -27,6 +27,7 @@ use super::calllog::{Arg, CallLog};
 use super::guest_ram::{GuestRam, PAGE_SIZE, RawRegion, copy_between};
 use super::script::Script;
 use crate::host::HostPtr;
+use crate::memory::kept::KeptLimits;
 use crate::num::{self, ToU64, ToUsize};
 use crate::platform::ObjId;
 use crate::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
@@ -168,6 +169,8 @@ pub struct FakeVm {
     state: Arc<Mutex<VmState>>,
     log: CallLog,
     script: Script,
+    /// What it lets a task keep of its transfer buffers' mappings: none until a test sets it.
+    kept: Arc<Mutex<KeptLimits>>,
 }
 
 impl FakeVm {
@@ -177,6 +180,7 @@ impl FakeVm {
             state: Arc::new(Mutex::new(VmState::default())),
             log,
             script,
+            kept: Arc::new(Mutex::new(KeptLimits::NONE)),
         }
     }
 
@@ -187,7 +191,14 @@ impl FakeVm {
             state: self.state.clone(),
             log: CallLog::new(),
             script: Script::new(),
+            kept: self.kept.clone(),
         }
+    }
+
+    /// Lets tasks keep `limits` of their transfer buffers' mappings
+    /// ([`HostVm::kept_mapping_limits`]), uncalled and unlogged.
+    pub fn set_kept_limits(&self, limits: KeptLimits) {
+        *self.kept.lock() = limits;
     }
 
     fn call(&self, sel: &'static str, args: Vec<Arg>) -> super::script::Step {
@@ -278,6 +289,10 @@ impl FakeVm {
 impl HostVm for FakeVm {
     fn page_size(&self) -> u64 {
         PAGE_SIZE
+    }
+
+    fn kept_mapping_limits(&self) -> KeptLimits {
+        *self.kept.lock()
     }
 
     fn page_shift(&self) -> u32 {

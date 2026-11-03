@@ -66,6 +66,20 @@ impl<P: Platform> GpuTask<P> {
         length: u64,
         need_writable: bool,
     ) -> RaiseResult<Option<Arc<Mapping<P>>>> {
+        self.mapping_of(hold, offset, length, need_writable, false)
+    }
+
+    /// [`GpuTask::new_virtual_mapping`]; with `keep`, the task's kept mapping of the same runs
+    /// where it has one, and the fresh one kept otherwise ([`crate::memory::kept`]): a transfer
+    /// buffer's.
+    fn mapping_of(
+        &self,
+        hold: Hold<'_>,
+        offset: u64,
+        length: u64,
+        need_writable: bool,
+        keep: bool,
+    ) -> RaiseResult<Option<Arc<Mapping<P>>>> {
         Self::check_task_range(offset, length, self.task_length())?;
         if self.task_root_ptr().is_none() {
             return raise_caught(
@@ -127,9 +141,14 @@ impl<P: Platform> GpuTask<P> {
         if need_writable && !writable {
             return Ok(None);
         }
-        Ok(self
-            .map()
-            .and_then(|m| m.new_range_mapping(&ranges, length, u32::from(!writable))))
+        let read_only = u32::from(!writable);
+        Ok(self.map().and_then(|m| {
+            if keep {
+                self.kept.mapping(&m, &ranges, length, read_only)
+            } else {
+                m.new_range_mapping(&ranges, length, read_only)
+            }
+        }))
     }
 
     /// The host address of task offset `offset`, through a mapping of the pages
@@ -489,11 +508,12 @@ impl<P: Platform> GpuTask<P> {
         page: u32,
         length: u64,
     ) -> RaiseResult<P::Buffer> {
-        let mapping = self.new_virtual_mapping(
+        let mapping = self.mapping_of(
             hold,
             u64::from(page).wrapping_shl(APV_PAGE_SHIFT),
             length,
             false,
+            true,
         )?;
         let Some(mapping) = mapping else {
             return raise_caught(
@@ -800,6 +820,70 @@ mod tests {
             caught(|hold| tx.task.new_buffer_for_virtual_page(hold, 1, PAGE)),
             Some(RaiseKind::NoBuffer.id())
         );
+    }
+
+    /// Where the platform lets a task keep its transfer buffers' mappings, a bind over the same
+    /// pages takes the kept one, and a fresh buffer over it; the page table is walked at each
+    /// bind, so a page the guest moved, or made read-only, is a fresh mapping of what it shows
+    /// now; the task's kept mappings go at `clear`, its end's
+    #[test]
+    fn a_bind_over_the_same_pages_takes_the_kept_mapping() {
+        use crate::memory::kept::KeptLimits;
+        use crate::testkit::calllog::Arg;
+        let tx = ready(&rw_pages(4));
+        tx.p.fake_vm().set_kept_limits(KeptLimits {
+            entries: 8,
+            bytes: 16 * PAGE,
+            runs: 16,
+        });
+        let log = tx.p.call_log();
+        let count = |sel: &str| log.count(sel);
+        let (allocated, buffers) = (
+            count("mach_vm_allocate"),
+            count("newBufferWithBytesNoCopy:length:options:deallocator:"),
+        );
+        drop(
+            tx.task
+                .new_buffer_for_virtual_page(Hold::NONE, 1, PAGE)
+                .unwrap(),
+        );
+        drop(
+            tx.task
+                .new_buffer_for_virtual_page(Hold::NONE, 1, PAGE)
+                .unwrap(),
+        );
+        assert_eq!(count("mach_vm_allocate"), allocated + 1);
+        assert_eq!(
+            count("newBufferWithBytesNoCopy:length:options:deallocator:"),
+            buffers + 2,
+            "a buffer made at each bind"
+        );
+        // The guest moves task page 1 to the data page 3
+        tx.ram.write_u32(page_pa(PT_PAGE) + 4, (DATA_PAGE + 3) | W);
+        drop(
+            tx.task
+                .new_buffer_for_virtual_page(Hold::NONE, 1, PAGE)
+                .unwrap(),
+        );
+        assert_eq!(count("mach_vm_allocate"), allocated + 2);
+        let source = tx.ram.host_addr(page_pa(DATA_PAGE + 3)).unwrap().addr();
+        let remap = log
+            .calls_of("mach_vm")
+            .into_iter()
+            .rev()
+            .find(|c| c.sel == "mach_vm_remap");
+        assert_eq!(remap.unwrap().args[1], Arg::Ptr(source));
+        // Read-only now
+        tx.ram.write_u32(page_pa(PT_PAGE) + 4, DATA_PAGE + 3);
+        drop(
+            tx.task
+                .new_buffer_for_virtual_page(Hold::NONE, 1, PAGE)
+                .unwrap(),
+        );
+        assert_eq!(count("mach_vm_allocate"), allocated + 3);
+        let deallocated = count("mach_vm_deallocate");
+        tx.task.kept.clear();
+        assert_eq!(count("mach_vm_deallocate"), deallocated + 3);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The OS services on Linux: the clocks ([`LinuxClock`]), threads ([`LinuxThreads`]), Mach VM's
 //! calls over `mmap` ([`LinuxVm`]), whose views of the guest's pages map the files the backing
-//! table names (`files`), IOSurface's stand-in over that memory ([`LinuxSurface`]), and what the
+//! table names (`files`), IOSurface's stand-in over that memory ([`LinuxSurface`]), whose backings
+//! may be dma-bufs of device memory under `REIMS_VGPU_VRAM_SURFACES` (`vram`), and what the
 //! window system's Vulkan extensions take here (`crate::os`'s `wsi`: the surface extensions and
 //! the loader). No Objective-C runs here: core pushes no autorelease pool where none is
 //! installed.
@@ -14,6 +15,7 @@ mod import;
 mod surface;
 mod threads;
 mod vm;
+mod vram;
 
 use std::ffi::CStr;
 
@@ -29,7 +31,12 @@ pub use vm::LinuxVm;
 pub(crate) use import::{
     TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, import_view, shown_at,
 };
-pub(crate) use surface::{plane_at, plane_shape, recorded_mut, surface_memory_hold, ycbcr_matrix};
+#[cfg(test)]
+pub(crate) use surface::has_base_anchor;
+pub(crate) use surface::{
+    anchors_live, keep_base_anchor, plane_at, plane_shape, recorded_mut, surface_declared,
+    surface_memory_hold, wants_base_anchor, ycbcr_matrix,
+};
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]
 pub(crate) use vm::tests::{PAGE, mapped, writable};

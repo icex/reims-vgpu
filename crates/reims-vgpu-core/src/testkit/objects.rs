@@ -395,6 +395,8 @@ pub struct SurfaceModel {
     pub allows_pixel_size_casting: bool,
     /// Outstanding `IOSurfaceLock`s.
     pub lock_count: i64,
+    /// The outstanding locks at each `cpu_wrote`, which logs no call: IOSurface has none.
+    pub cpu_writes: Vec<i64>,
     /// The creation spec, when made by `IOSurfaceCreate`.
     pub spec: Option<crate::platform::os::surface::SurfaceSpec>,
     /// The creation properties, when made by `initWithProperties:`.

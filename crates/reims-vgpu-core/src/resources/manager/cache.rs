@@ -322,7 +322,12 @@ impl<P: Platform> ResourceManager<P> {
         // No cycle detection. A creator that looks its own reference up again re-enters this lock
         // and recurses until the stack overflows.
         // The entry and record are read now only; a cached object never reads them again.
-        let object = match K::create_object(hold, self, reference, &entry, cursor, placement)? {
+        let made = crate::trace::span_start();
+        let object = K::create_object(hold, self, reference, &entry, cursor, placement)?;
+        // 63: the creation: the reference, the object type
+        let object_type = u64::from(entry.object_type());
+        crate::trace::span(63, made, &[u64::from(reference), object_type]);
+        let object = match object {
             Ok(object) => object,
             Err(e) => return Ok(Err(e)),
         };
@@ -362,18 +367,46 @@ impl<P: Platform> ResourceManager<P> {
         }
     }
 
+    /// [`ResourceManager::delete_object`] of the resource `reference`, clearing its placement
+    /// slot, but a resource whose last release reaches neither the host nor anything it sees
+    /// ([`Resource::releases_internally`]) comes back, released by the caller after its own
+    /// locks. Any other is released here, before the slot's clear, as `delete_object` does.
+    pub fn delete_resource(&self, hold: Hold<'_>, reference: u32) -> Option<Arc<Resource<P>>> {
+        let _creation = self.creation.lock();
+        let removed = self.with_caches(|c| c.resources.remove(reference));
+        let internal = match removed {
+            Some(resource) if resource.releases_internally() => Some(resource),
+            other => {
+                drop(other);
+                None
+            }
+        };
+        self.clear_placement_list_entry(hold, reference);
+        internal
+    }
+
     /// The guest's serialized delete (opcode 40): the operation word at 0 and the reference at
     /// 8. A short command, or an operation that deletes nothing, is `false`.
     pub fn delete_serialized_object(&self, hold: Hold<'_>, command: &[u8]) -> bool {
+        self.delete_serialized(hold, command).0
+    }
+
+    /// [`ResourceManager::delete_serialized_object`], and a resource it deleted whose release is
+    /// the caller's ([`ResourceManager::delete_resource`]).
+    pub fn delete_serialized(
+        &self,
+        hold: Hold<'_>,
+        command: &[u8],
+    ) -> (bool, Option<Arc<Resource<P>>>) {
         let (Some(op), Some(reference)) = (word(command, 0), word(command, 8)) else {
-            return false;
+            return (false, None);
         };
         let Some(deletion) = Deletion::of(op) else {
             log::warn!("delete of object {reference} ignored: unknown operation {op}");
-            return false;
+            return (false, None);
         };
         match deletion {
-            Deletion::Resource => self.delete_object::<Resources>(hold, reference, true),
+            Deletion::Resource => return (true, self.delete_resource(hold, reference)),
             Deletion::DepthStencil => {
                 self.delete_object::<DepthStencilStates>(hold, reference, true)
             }
@@ -388,7 +421,7 @@ impl<P: Platform> ResourceManager<P> {
             Deletion::Fence => self.delete_object::<Fences>(hold, reference, true),
             Deletion::RateMap => self.delete_object::<RasterizationRateMaps>(hold, reference, true),
         }
-        true
+        (true, None)
     }
 
     /// Zeroes the placement slot of `reference`, mapping the placement list first (under the

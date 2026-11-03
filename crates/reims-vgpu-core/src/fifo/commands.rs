@@ -256,6 +256,7 @@ impl<P: Platform> Fifo<P> {
                 let held = Held::new();
                 h(&mut Command {
                     fifo: self,
+                    device: std::cell::OnceCell::new(),
                     held: &held,
                     hold: Hold::of(&held),
                     header,
@@ -343,6 +344,8 @@ pub(crate) fn add3_overflows(a: u32, b: u32, c: u32) -> (u32, bool) {
 /// and its payload.
 pub(crate) struct Command<'a, P: Platform> {
     fifo: &'a Arc<Fifo<P>>,
+    /// The device, from the handler's first use of it ([`Command::device`]).
+    device: std::cell::OnceCell<Arc<DeviceCore<P>>>,
     /// Released when the handler returns, before the command's pool pops (module doc).
     held: &'a Held,
     /// The command's unit of work: no handler, and `held` as its holder.
@@ -362,12 +365,14 @@ impl<P: Platform> Command<'_, P> {
     }
 
     /// The device. The device outlives its FIFOs (it drains them before it goes), so a gone one
-    /// is a use after free: a death at the handler's first use of it.
-    fn device(&self) -> Arc<DeviceCore<P>> {
-        match self.fifo.device.upgrade() {
-            Some(d) => d,
-            None => fatal!(DeathKind::DeviceGone),
-        }
+    /// is a use after free: a death at the handler's first use of it. Loaded once per command,
+    /// at that use, and held to the command's end.
+    fn device(&self) -> &Arc<DeviceCore<P>> {
+        self.device
+            .get_or_init(|| match self.fifo.device.upgrade() {
+                Some(d) => d,
+                None => fatal!(DeathKind::DeviceGone),
+            })
     }
 
     /// The device's features, read now.

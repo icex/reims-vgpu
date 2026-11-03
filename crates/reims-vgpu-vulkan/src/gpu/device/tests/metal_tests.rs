@@ -2855,6 +2855,7 @@ fn noisy_surface(
         // SAFETY: inside the surface's allocation, which no GPU work uses yet.
         unsafe { base.add(at).write(next().to_le_bytes()[0]) };
     }
+    s.cpu_wrote();
     s
 }
 

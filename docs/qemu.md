@@ -1479,6 +1479,15 @@ Measured facts about driving it (on this host, macOS 26.7, 25G229):
   `input-send-event` with `abs` axes (0 to 32767) moves and clicks it, and
   HMP's `mouse_move`, which sends relative motion, does nothing. HMP
   `sendkey` reaches the USB keyboard.
+- **A drag is checked by its window's bounds**, not by the input count. On
+  an x86-64 macOS 26.7.1 guest (25G241, Linux host), 1,920 absolute moves
+  over eight seconds at a Finder window's horizontal centre, 15 points
+  below its top, left its bounds unchanged. A point 500 points from its
+  left and 35 below its top moved that window; a bounds read during the
+  drag verified it. The toolbar's hit regions depend on its layout, so a
+  point that worked on another window is no guarantee. A minimized host
+  window also renders nothing: record its presentation rate as well as
+  the guest's, and restore it before timing the visible desktop.
 - **Scrolling** (2026-10-01, macOS 13.6 guest, the machine's default
   `usb-vmapple-tablet`, QMP `input-send-event` as the window's callbacks
   would send it, measured by an AppKit window in the guest logging its

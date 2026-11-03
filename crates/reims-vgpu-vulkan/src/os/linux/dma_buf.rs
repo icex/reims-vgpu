@@ -35,9 +35,32 @@
 //! which QEMU's `seal=on`, its default, sets, and [`super::vm::memfd`] sets on the library's own),
 //! at page offsets. The device node is the `kvm` group's on Ubuntu.
 //!
+//! **Device memory.** A backing IOSurface's memory under `REIMS_VGPU_VRAM_SURFACES` is a dma-buf
+//! of device memory already ([`super::vram`]): a window of it from its start is given as one
+//! duplicate of that dma-buf, which meets any granule, before anything here looks for
+//! `/dev/udmabuf`, and is never kept; a window of it otherwise is refused
+//! ([`Refusal::VramWindow`]).
+//!
 //! Pieces of the block of zeros read-only aliases share ([`super::import::allocate_zeros`]) are
 //! made of a file of zeros of the import's own instead, as an import's twin maps private zeros
 //! there: the GPU's writes stay in it and never reach the block.
+//!
+//! **Kept.** A paged texture's transfer buffer is made again at each bind, and the runtime imports
+//! it anew, asking for dma-bufs of the same window of the guest's RAM each time (a Finder drag's
+//! 1,860 binds covered 180 windows). So the dma-bufs of a window wholly in the guest's RAM, the
+//! files the backing table's registrations name, with no zeros and no pad, are kept, by its runs
+//! of file pages and its granule ([`KEPT_WINDOWS`], [`KEPT_BYTES`]), and the next call for the
+//! same runs and granule is given duplicates of them. A udmabuf keeps the pages it pinned, while
+//! the host may drop a page from its file (QEMU punches holes for a balloon, a discard or a
+//! reset), and the library is told of none of it. So a kept window is given again only while
+//! every file of it shows the change time it showed before its dma-bufs were made, a time older
+//! than the coarse clock's tick read before that, so any change after it moves the time: on
+//! Linux 7.2 (measured, `a_punched_hole_moves_the_files_change_time`) a hole punched in a memfd
+//! moves its change time, as does the first write fault of a page through any mapping of it, which
+//! then only makes the window anew. Only files of tmpfs (memfds, QEMU's `memory-backend-memfd`)
+//! are kept. What could still pass unseen is a punch at a moment the realtime clock, set back,
+//! gives the very nanosecond the file showed. All go once a lease of the guest's RAM goes
+//! ([`forget_kept`]), so no file outlives the device that registered it here.
 
 use std::fmt;
 use std::io;
@@ -45,6 +68,8 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_runtime::DmaBufChunk;
+use reims_vgpu_core::num::ToU64 as _;
+use reims_vgpu_core::sync::Mutex;
 
 use super::files::{self, Backing};
 use super::vm;
@@ -79,6 +104,9 @@ pub(crate) enum Refusal {
     /// The kernel refused the call otherwise (a file it takes no pages of, unsealed or not a
     /// memfd, or no memory to pin the pages).
     Kernel(io::Error),
+    /// The range lies in a backing's device memory ([`super::vram`]) other than as one piece from
+    /// its dma-buf's start: `offset` bytes into it, among `pieces` pieces.
+    VramWindow { offset: u64, pieces: u64 },
 }
 
 impl fmt::Display for Refusal {
@@ -103,6 +131,12 @@ impl fmt::Display for Refusal {
                 limits.bytes >> 20,
             ),
             Refusal::Kernel(e) => write!(f, "UDMABUF_CREATE_LIST failed: {e}"),
+            Refusal::VramWindow { offset, pieces } => write!(
+                f,
+                "the range lies {offset:#x} bytes into a dma-buf of VRAM, among {pieces} pieces: \
+                 the runtime's chunks carry no offset into a dma-buf, and udmabuf takes no pages \
+                 of one"
+            ),
         }
     }
 }
@@ -226,14 +260,167 @@ fn padded<F: Clone>(
     chunks(runs, granule, limits)
 }
 
+/// The most windows kept (module docs, "Kept").
+const KEPT_WINDOWS: usize = 64;
+
+/// The most bytes the kept windows pin, all together.
+const KEPT_BYTES: u64 = 256 << 20;
+
+/// A file's change time, and whether its file system is tmpfs, read now; `None` where `fstat`
+/// or `fstatfs` refuses.
+fn change_time(file: &OwnedFd) -> Option<((i64, i64), bool)> {
+    // SAFETY: plain old data the calls fill.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: an open descriptor and a stat to fill.
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
+        return None;
+    }
+    // SAFETY: plain old data the call fills.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: an open descriptor and a statfs to fill.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } != 0 {
+        return None;
+    }
+    let tmpfs = fs.f_type == libc::TMPFS_MAGIC;
+    Some(((stat.st_ctime, stat.st_ctime_nsec), tmpfs))
+}
+
+/// The coarse realtime clock now, the clock file times are read from (module docs, "Kept").
+fn coarse_now() -> (i64, i64) {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a timespec to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut now) };
+    (now.tv_sec, now.tv_nsec)
+}
+
+/// A file of a kept window and the change time it showed before its dma-bufs were made.
+struct Stamp {
+    file: Arc<OwnedFd>,
+    changed: (i64, i64),
+}
+
+/// The stamps of the files of `runs`, read after the coarse clock: `None` where one is not of
+/// tmpfs, or shows a change in the clock's tick or after it, which a later change could repeat.
+fn stamps(runs: &[Run<Arc<OwnedFd>>]) -> Option<Vec<Stamp>> {
+    let now = coarse_now();
+    let mut stamps: Vec<Stamp> = Vec::new();
+    for run in runs {
+        if stamps.iter().any(|s| Arc::ptr_eq(&s.file, &run.file)) {
+            continue;
+        }
+        let (changed, tmpfs) = change_time(&run.file)?;
+        if !tmpfs || changed >= now {
+            return None;
+        }
+        stamps.push(Stamp {
+            file: Arc::clone(&run.file),
+            changed,
+        });
+    }
+    Some(stamps)
+}
+
+/// A kept window: its runs and granule, the stamps of its files, and its dma-bufs.
+struct KeptWindow {
+    runs: Vec<Run<Arc<OwnedFd>>>,
+    granule: u64,
+    stamps: Vec<Stamp>,
+    chunks: Vec<DmaBufChunk>,
+}
+
+impl KeptWindow {
+    /// Whether it is the window of `runs` at `granule`.
+    fn is(&self, runs: &[Run<Arc<OwnedFd>>], granule: u64) -> bool {
+        self.granule == granule
+            && self.runs.len() == runs.len()
+            && self.runs.iter().zip(runs).all(|(a, b)| {
+                Arc::ptr_eq(&a.file, &b.file) && a.offset == b.offset && a.length == b.length
+            })
+    }
+
+    /// The bytes its dma-bufs pin.
+    fn bytes(&self) -> u64 {
+        self.chunks.iter().map(|c| c.length).sum()
+    }
+
+    /// Whether every file shows the change time it was stamped with.
+    fn unchanged(&self) -> bool {
+        (self.stamps.iter())
+            .all(|s| change_time(&s.file).is_some_and(|(changed, _)| changed == s.changed))
+    }
+
+    /// Duplicates of its dma-bufs; `None` where the kernel gives none.
+    fn duplicates(&self) -> Option<Vec<DmaBufChunk>> {
+        (self.chunks.iter())
+            .map(|c| {
+                Some(DmaBufChunk {
+                    fd: c.fd.try_clone().ok()?,
+                    length: c.length,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The kept windows, most recently used last. A leaf lock: no call is made under it.
+static KEPT: Mutex<Vec<KeptWindow>> = Mutex::new(Vec::new());
+
+/// The kept window of `runs` at `granule`, taken out; the caller puts it back.
+fn take_kept(runs: &[Run<Arc<OwnedFd>>], granule: u64) -> Option<KeptWindow> {
+    let mut kept = KEPT.lock();
+    let at = kept.iter().position(|w| w.is(runs, granule))?;
+    Some(kept.remove(at))
+}
+
+/// Keeps `window` as the most recently used, letting the least recently used go past the limits,
+/// outside the lock.
+fn keep(window: KeptWindow) {
+    let gone = {
+        let mut kept = KEPT.lock();
+        kept.push(window);
+        let mut bytes: u64 = kept.iter().map(KeptWindow::bytes).sum();
+        let mut gone = Vec::new();
+        while kept.len() > KEPT_WINDOWS || bytes > KEPT_BYTES {
+            let oldest = kept.remove(0);
+            bytes -= oldest.bytes();
+            gone.push(oldest);
+        }
+        gone
+    };
+    drop(gone);
+}
+
+/// Lets every kept window go: a lease of the guest's RAM goes ([`super::files`]).
+pub(crate) fn forget_kept() {
+    let gone = std::mem::take(&mut *KEPT.lock());
+    drop(gone);
+}
+
+/// The windows kept now, for tests.
+#[cfg(test)]
+fn kept_windows() -> usize {
+    KEPT.lock().len()
+}
+
 /// Dma-bufs of the `length` bytes from `first`, whole pages, each resolved through the backing
 /// table, which in order are those bytes: one piece for each run of a file's pages that follow on,
 /// the block of zeros' pieces from a file of zeros of the import's own, cut into chunks within
-/// udmabuf's limits at multiples of `granule` from `first` (module docs).
+/// udmabuf's limits at multiples of `granule` from `first` (module docs). Those of a window of
+/// the guest's RAM are kept for the next call over the same pages, and given again while its
+/// files show no change (module docs, "Kept"). A window of a backing's device memory is a
+/// duplicate of its dma-buf (module docs, "Device memory").
 pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaBufChunk>, Refusal> {
     let page = vm::page_size();
     debug_assert!(first.is_multiple_of(page) && length.is_multiple_of(page));
     let resolved = files::pieces(first, length).ok_or(Refusal::Unresolved)?;
+    if let Some(answer) = super::vram::chunks_of(&resolved, length) {
+        // vdma: the window's length, the granule, whether its dma-buf was given
+        reims_vgpu_core::trace::event("vdma", &[length, granule, u64::from(answer.is_ok())]);
+        return answer;
+    }
     let zero_bytes: u64 = (resolved.iter())
         .filter(|p| super::import::zeros(&p.backing.fd))
         .map(|p| p.length)
@@ -270,6 +457,22 @@ pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaB
     let device = device()?;
     let limits = limits();
     let granule = granule.max(page);
+    let keepable = zeros.is_none() && runs.iter().all(|r| files::guest_ram(&r.file));
+    if keepable && let Some(window) = take_kept(&runs, granule) {
+        let given = window.unchanged().then(|| window.duplicates()).flatten();
+        // kdma: whether a kept window's dma-bufs were given again, its chunks
+        reims_vgpu_core::trace::event(
+            "kdma",
+            &[u64::from(given.is_some()), window.chunks.len().to_u64()],
+        );
+        if let Some(chunks) = given {
+            keep(window);
+            return Ok(chunks);
+        }
+        drop(window);
+    }
+    let stamped = keepable.then(|| stamps(&runs)).flatten();
+    let window_runs = stamped.as_ref().map(|_| runs.clone());
     let refused = |runs: &[Run<Arc<OwnedFd>>]| Refusal::Limit {
         pieces: runs.len() as u64,
         bytes: length,
@@ -281,6 +484,7 @@ pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaB
         offset: 0,
         length: pad,
     };
+    let unpadded = runs.len();
     let cut = padded(&mut runs, granule, limits, pad).ok_or_else(|| refused(&runs))?;
     let made = cut.iter().map(|chunk| {
         let fd = create(device, chunk)?;
@@ -289,7 +493,24 @@ pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaB
             length: chunk.iter().map(|r| r.length).sum(),
         })
     });
-    made.collect()
+    let chunks: Vec<DmaBufChunk> = made.collect::<Result<_, Refusal>>()?;
+    // A window with a pad of its own is not kept: the pad is the import's alone.
+    if runs.len() == unpadded
+        && let (Some(stamps), Some(window_runs)) = (stamped, window_runs)
+    {
+        let mut window = KeptWindow {
+            runs: window_runs,
+            granule,
+            stamps,
+            chunks,
+        };
+        if let Some(given) = window.duplicates() {
+            keep(window);
+            return Ok(given);
+        }
+        return Ok(std::mem::take(&mut window.chunks));
+    }
+    Ok(chunks)
 }
 
 /// One dma-buf of `runs`, in order (`UDMABUF_CREATE_LIST`).
@@ -315,7 +536,7 @@ fn create(device: &OwnedFd, runs: &[Run<Arc<OwnedFd>>]) -> Result<OwnedFd, Refus
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
+    use reims_vgpu_core::num::ToUsize as _;
     use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _};
 
     use super::*;
@@ -555,5 +776,185 @@ mod tests {
             }
             at += chunk.length / page;
         }
+    }
+
+    /// A window of a backing's device memory from its start is one duplicate of its dma-buf,
+    /// whatever the granule, showing the CPU's writes, with no udmabuf asked for: so where
+    /// `/dev/udmabuf` does not open too
+    #[test]
+    fn a_window_at_the_start_of_vram_memory_is_its_dma_buf() {
+        let page = vm::page_size();
+        let exporter = super::super::vram::tests::test_exporter();
+        let own = vm::OwnMemory::in_vram(2 * page, exporter).unwrap();
+        let first = own.first();
+        // SAFETY: the memory just mapped, read and write.
+        unsafe { vm::ptr(first + page + 5).cast::<u8>().write_volatile(0x5c) };
+        let duplicates = super::super::vram::live().duplicates;
+        let whole = of_pages(first, 2 * page, page).unwrap();
+        assert_eq!((whole.len(), whole[0].length), (1, 2 * page));
+        assert_eq!(read_through(&whole[0], page + 5), 0x5c);
+        let start = of_pages(first, page, 4 * page).unwrap();
+        assert_eq!((start.len(), start[0].length), (1, page));
+        assert_eq!(super::super::vram::live().duplicates, duplicates + 2);
+    }
+
+    /// A window inside a backing's device memory is refused, naming its offset, and no udmabuf
+    /// is asked for
+    #[test]
+    fn a_window_inside_vram_memory_is_refused() {
+        let page = vm::page_size();
+        let exporter = super::super::vram::tests::test_exporter();
+        let own = vm::OwnMemory::in_vram(2 * page, exporter).unwrap();
+        let refused = of_pages(own.first() + page, page, page).unwrap_err();
+        assert!(
+            matches!(refused, Refusal::VramWindow { offset, pieces: 1 } if offset == page),
+            "{refused}"
+        );
+    }
+
+    /// Held by each test of kept windows: the windows are the process's.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    /// A memfd of `pages` pages, sealed as QEMU's, mapped shared and registered as the guest's
+    /// RAM at its mapping, and its change time left a few ticks behind the coarse clock.
+    fn guest_ram(pages: u64) -> (u64, Arc<OwnedFd>, super::super::files::GuestMemoryLease) {
+        let page = vm::page_size();
+        let fd = vm::memfd(pages * page);
+        let backing = Backing {
+            fd: Arc::clone(&fd),
+            offset: 0,
+        };
+        let at = vm::file(
+            None,
+            pages * page,
+            &backing,
+            libc::PROT_READ | libc::PROT_WRITE,
+        )
+        .unwrap();
+        for i in 0..pages {
+            // SAFETY: the mapping this test just made, read and write.
+            unsafe {
+                vm::ptr(at + i * page)
+                    .cast::<u8>()
+                    .write_volatile(0x20 + i as u8)
+            };
+        }
+        let lease = super::super::files::lease_guest_memory([crate::os::GuestRamFile {
+            host: at,
+            length: pages * page,
+            fd: Arc::clone(&fd),
+            offset: 0,
+        }]);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        (at, fd, lease)
+    }
+
+    /// The dma-buf's inode: duplicates share it.
+    fn inode(chunk: &DmaBufChunk) -> u64 {
+        // SAFETY: plain old data the call fills.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: an open descriptor and a stat to fill.
+        assert_eq!(unsafe { libc::fstat(chunk.fd.as_raw_fd(), &mut stat) }, 0);
+        stat.st_ino
+    }
+
+    /// Measured on Linux 7.2: a hole punched in a memfd moves its change time, read or not since
+    /// the last change, as does the first write fault of a page through a mapping; a read of a
+    /// page and a write of one written through the same mapping move nothing. Kept windows are
+    /// given again only while their files' times stand (module docs, "Kept")
+    #[test]
+    fn a_punched_hole_moves_the_files_change_time() {
+        let page = vm::page_size();
+        let (at, fd, lease) = guest_ram(4);
+        let changed = || change_time(&fd).unwrap();
+        let (before, tmpfs) = changed();
+        assert!(tmpfs, "a memfd is of tmpfs");
+        assert!(before < coarse_now());
+        // SAFETY: the test's mapping, read and write.
+        unsafe {
+            let _ = vm::ptr(at).cast::<u8>().read_volatile();
+            vm::ptr(at + 1).cast::<u8>().write_volatile(1);
+        }
+        assert_eq!(changed(), (before, true));
+        // SAFETY: a hole punched in the test's own file.
+        let punched = unsafe {
+            libc::fallocate(
+                fd.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                0,
+                page as libc::off_t,
+            )
+        };
+        assert_eq!(punched, 0);
+        let after = changed();
+        assert_ne!(after.0, before);
+        // At once again, in the same tick
+        // SAFETY: as above.
+        let punched = unsafe {
+            libc::fallocate(
+                fd.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                page as libc::off_t,
+                page as libc::off_t,
+            )
+        };
+        assert_eq!(punched, 0);
+        assert_ne!(changed(), after);
+        drop(lease);
+        // SAFETY: the test's mapping, which nothing uses any more.
+        unsafe { libc::munmap(vm::ptr(at), (4 * page).to_usize()) };
+    }
+
+    /// A window of the guest's RAM is kept and given again, its dma-bufs duplicates of the first,
+    /// until its file changes: then made anew, of the pages the file shows now; a window of other
+    /// memory is not kept; the lease's drop lets the kept go
+    #[test]
+    fn a_kept_window_is_given_again_until_its_file_changes() {
+        if !udmabuf() {
+            return;
+        }
+        let _one = ONE_AT_A_TIME.lock();
+        forget_kept();
+        let page = vm::page_size();
+        let (at, fd, lease) = guest_ram(4);
+        let first = of_pages(at + page, 2 * page, page).unwrap();
+        assert_eq!(kept_windows(), 1);
+        let again = of_pages(at + page, 2 * page, page).unwrap();
+        assert_eq!(inode(&again[0]), inode(&first[0]), "the same dma-buf");
+        assert_eq!(read_through(&again[0], 0), 0x21);
+        // Another granule is another window
+        let other = of_pages(at + page, 2 * page, 2 * page).unwrap();
+        assert_ne!(inode(&other[0]), inode(&first[0]));
+        assert_eq!(kept_windows(), 2);
+        // The host drops the second page from the file: the kept window is not given again
+        // SAFETY: a hole punched in the test's own file.
+        let punched = unsafe {
+            libc::fallocate(
+                fd.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                page as libc::off_t,
+                page as libc::off_t,
+            )
+        };
+        assert_eq!(punched, 0);
+        assert_eq!(
+            read_through(&first[0], 0),
+            0x21,
+            "a udmabuf keeps the page it pinned"
+        );
+        let fresh = of_pages(at + page, 2 * page, page).unwrap();
+        assert_ne!(inode(&fresh[0]), inode(&first[0]));
+        assert_eq!(read_through(&fresh[0], 0), 0, "the file's page now");
+        // The changed window went; the fresh one is kept unless made in the change's tick
+        let kept = kept_windows();
+        assert!((1..=2).contains(&kept), "{kept}");
+        // Memory of the library's own is never kept
+        let own = vm::allocate_aliasable(2 * page).unwrap().addr().to_u64();
+        drop(of_pages(own, 2 * page, page).unwrap());
+        assert_eq!(kept_windows(), kept);
+        drop(lease);
+        assert_eq!(kept_windows(), 0);
+        // SAFETY: the test's mapping, which nothing uses any more.
+        unsafe { libc::munmap(vm::ptr(at), (4 * page).to_usize()) };
     }
 }

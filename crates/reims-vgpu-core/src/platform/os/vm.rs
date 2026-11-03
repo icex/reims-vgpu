@@ -6,6 +6,7 @@
 use std::ops::BitOr;
 
 use crate::host::HostPtr;
+use crate::memory::kept::KeptLimits;
 
 /// A host virtual address (`mach_vm_address_t`). Host addresses are [`HostPtr`]s throughout core,
 /// so that `guest` is the only place that turns one into a pointer.
@@ -89,6 +90,14 @@ pub trait HostVm: Send + Sync {
     fn protect_max(&self, addr: HostAddr, len: u64, prot: VmProt) -> Result<(), KernReturn>;
     /// `mach_vm_deallocate(task, addr, len)`. Every caller ignores the result.
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn;
+    /// How much of the mappings a task's transfer buffers were made over core may keep for the
+    /// next buffer over the same pages ([`crate::memory::kept`]): none, unless a fresh mapping of
+    /// the memory map's pages shows exactly what a kept one does, whatever the host does to its
+    /// memory meanwhile. Mach's remap aliases the host's memory as it is at the call, which the
+    /// host may replace at the same address, so none by default.
+    fn kept_mapping_limits(&self) -> KeptLimits {
+        KeptLimits::NONE
+    }
 }
 
 #[cfg(test)]

@@ -200,9 +200,18 @@ pub(crate) fn own_buffer(
     options: rt::ResourceOptions,
     contents: rt::BufferContents<'_>,
 ) -> Result<rt::Buffer, rt::Error> {
-    let descriptor = rt::BufferDescriptor::new(length, options, contents)
-        .with_placement(rt::AddressPlacement::Outside);
-    device.new_buffer_with_descriptor(descriptor)
+    device.new_buffer_with_descriptor(own_descriptor(length, options, contents))
+}
+
+/// The descriptor of an [`own_buffer`], for a caller that adds to it (a surface's base anchor,
+/// the declaration of its memory's writes).
+pub(crate) fn own_descriptor(
+    length: u64,
+    options: rt::ResourceOptions,
+    contents: rt::BufferContents<'_>,
+) -> rt::BufferDescriptor<'_> {
+    rt::BufferDescriptor::new(length, options, contents)
+        .with_placement(rt::AddressPlacement::Outside)
 }
 
 /// A raw `MTLResourceOptions`, sent with `sel`.

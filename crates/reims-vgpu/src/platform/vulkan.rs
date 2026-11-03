@@ -37,6 +37,14 @@ impl ApiPlatform for VulkanPlatform {
         reims_vgpu_vulkan::api::read_pixels(texture, dst, bytes_per_row);
     }
 
+    fn frame_pixels(
+        &self,
+        texture: &<Self as Platform>::Texture,
+    ) -> Option<Box<dyn FramePixels<Self>>> {
+        reims_vgpu_vulkan::api::FramePixels::new(texture)
+            .map(|pixels| Box::new(VulkanFramePixels(pixels)) as Box<dyn FramePixels<Self>>)
+    }
+
     /// The files behind the map's ranges, registered while the device lives
     /// (`reims_vgpu_vulkan::os::lease_guest_memory`): on Linux the platform makes its views of the
     /// guest's pages of them. A range without a file is not registered, and a view of its pages
@@ -54,5 +62,21 @@ impl ApiPlatform for VulkanPlatform {
             })
         });
         Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files))
+    }
+}
+
+struct VulkanFramePixels(reims_vgpu_vulkan::api::FramePixels);
+
+impl FramePixels<VulkanPlatform> for VulkanFramePixels {
+    fn encode(
+        &self,
+        command_buffer: &<VulkanPlatform as Platform>::CommandBuffer,
+        texture: &<VulkanPlatform as Platform>::Texture,
+    ) {
+        self.0.encode(command_buffer, texture);
+    }
+
+    fn read(&self, dst: &mut [u8], bytes_per_row: usize) {
+        self.0.read(dst, bytes_per_row);
     }
 }

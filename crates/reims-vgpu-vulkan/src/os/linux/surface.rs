@@ -13,7 +13,11 @@
 //!   into it; one of several ranges is a view of them ([`super::vm::LinuxVm`]), read-only for
 //!   the CPU where it is read-only for the GPU (`kIOSurfaceClientDirection` 2), as IOSurface maps
 //!   it on macOS. A protected surface (protection options other than 0) has no memory the CPU
-//!   reaches: its base address is NULL.
+//!   reaches: its base address is NULL. Under `REIMS_VGPU_VRAM_SURFACES=1`, a backing core makes
+//!   of one plane at its base is a dma-buf of device-local, host-visible memory instead
+//!   ([`super::vram`]): the same bytes, zeros first, whose CPU reads are slow, which no path of a
+//!   backing makes, and which a GPU reset that loses device memory loses; one the switch cannot
+//!   place is a memfd's, as without it.
 //!   The mapping goes with the surface's last object, or later with the last hold on it
 //!   ([`surface_memory_hold`]): a device's import of the pages at the surface's base address
 //!   holds one until the runtime has freed the import, so the pages stay mapped while it lives
@@ -27,6 +31,63 @@
 //!   reference: the retain count stays the objects'. Measured on an Iris Xe (Mesa 26.2.4's ANV,
 //!   i915): ANV puts every live import in each execbuffer, and one whose pages are unmapped
 //!   fails it with `EFAULT`, which ANV answers as the device lost.
+//! - **Base anchors.** From a surface's second buffer over its base address on a device
+//!   ([`wants_base_anchor`]), a surface of its own memory or a view keeps one buffer of the
+//!   platform's own over its base ([`keep_base_anchor`]), outside the Metal address space, with
+//!   no deallocator, whose keep-alive holds only the memory hold. It lies in the runtime's import
+//!   of the guest's buffer it was made after, so that import, and the images the runtime shares
+//!   over it, live between the guest's buffers until the surface's last object (lookups
+//!   included) goes: a guest that makes a buffer or texture over the same surface at each frame
+//!   (macOS 26's WindowServer) joins it where it would import the pages again. The anchor counts
+//!   no reference: the retain count stays the objects'. A surface over a single range of the
+//!   guest's pages takes none, as its hold is an unmap hold on the range, which an anchor would
+//!   extend, and nor does a protected one, which maps no memory.
+//!   - *What it costs.* What the anchor keeps is held between the guest's buffers where nothing
+//!     was: the import's `VkDeviceMemory` over the pinned pages (by their pointer, or udmabufs
+//!     and a dma-buf import on RADV), up to the runtime's `HELD_PER_IMPORT` shared images, each
+//!     a dma-buf image import of its own there, and, over a surface whose writes are declared
+//!     (below), up to `HELD_PER_IMPORT` shared shadow images, each an image of the runtime's own
+//!     device memory as large as the texture whose shadow it was (14.7 MB for a 2560 × 1440
+//!     BGRA8 plane), which without the declaration went with that texture. That reaches the
+//!     guest only at exhaustion: a later buffer or texture can be refused for lack of device
+//!     memory one call sooner, a nil or a death at an earlier op, and one that joins the
+//!     anchor's import is not refused where a new import would have been
+//!     (`VulkanDevice::buffer_over_surface_at`). Bounded by one import, its shared images and
+//!     its shadow images, per anchored surface and device, held until the surface's last object
+//!     goes.
+//!   - *Exposed for good.* The anchor is a second buffer lying in a dma-buf import, which the
+//!     runtime then keeps imported for good (read from the runtime's code: `HostPages::new`
+//!     exposes an import a second buffer lies in, and `Residency::expose` makes it
+//!     unreleasable and closes the dma-buf descriptors it kept to import it again). So the
+//!     runtime's release of idle imports never takes an anchored surface's: one not drawn again
+//!     stays in each submission's buffer-object list on RADV until its last object goes. And
+//!     `host_import_fds_kept` (the trace's `wc3`) counts no anchored import's descriptors.
+//! - **Declared writes.** A surface of its own memory declares its memory's writes to the
+//!   runtime (`rt::DeclaredMemory`, [`surface_declared`]) as its first buffer or texture is
+//!   made: every buffer the device makes over it carries the declaration (the guest's
+//!   `newBufferWithIOSurface:`, a texture's own buffer and the base anchor, the last two with
+//!   their pages fixed), and the library's CPU writes through its base address are declared
+//!   (`Surface::cpu_wrote`; core's test pattern is the only one). The runtime then keeps a
+//!   shadowed texture's image over it from one command buffer to the next while nothing wrote
+//!   the bytes, where it would copy them in again; what the GPU reads is the same. Its CPU
+//!   address never leaves the library: the C API and the host's callbacks are given no
+//!   surface's memory, and a host-only surface of the IOSurface device is never mapped for the
+//!   guest. Lending stays in the process: another task takes the same object
+//!   (`ToHost::RetainIoSurface`), whose buffers and textures carry the same declaration, or the
+//!   runtime's same texture through a shared-texture handle. So the library withdraws none; the
+//!   runtime withdraws one on its own where its contract breaks (a declared buffer's `contents`
+//!   handed out, as an argument encoder's or `copyParameterDataToBuffer:`'s fallback takes it, a
+//!   guest's detach of its buffer over the surface, refused or not, a buffer of a second device
+//!   over it), and the surface's textures copy in as an undeclared one's from then on. A surface
+//!   over the guest's pages, which the guest writes, and a protected one declare nothing.
+//!   - *What it costs.* Over a texture's own buffer, whose pages are fixed, the runtime shares
+//!     one shadow image among the surface's textures of the same image, which the import keeps
+//!     while no texture uses it, up to `HELD_PER_IMPORT` per import, until the import goes: while
+//!     a guest's buffer over the surface lives, or the base anchor keeps the import (above),
+//!     for the surface's life. That reaches the guest only at exhaustion: a later buffer,
+//!     texture or import can be refused for lack of device memory one call sooner, a nil or a
+//!     death at an earlier op. Bounded by `HELD_PER_IMPORT` such images per import of the
+//!     surface's memory on a device, each the size of a texture made over the surface.
 //! - **What it answers** is the spec's: its planes, rows and sizes, its allocation size exactly
 //!   as given. It holds no values (`IOSurfaceCopyValue`): nothing in the process sets one.
 //!   `lock` and `unlock` do nothing.
@@ -54,9 +115,12 @@
 //! byte per element and rows of its width rounded up to 128 bytes (measured on the M3 Max:
 //! widths 16, 17, 32 and 65535).
 
+use std::fmt;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
+use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::{HostPtr, PhysicalMemoryRange};
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::os::surface::{
@@ -67,6 +131,7 @@ use reims_vgpu_core::platform::{Handle, ObjId};
 use reims_vgpu_core::sync::Mutex;
 
 use super::vm::{LinuxVm, OwnMemory};
+use super::vram::{self, Exporter};
 use crate::os::{MadeOver, READ_ONLY_DIRECTION, page_runs};
 use crate::platform::VulkanPlatform;
 
@@ -112,10 +177,16 @@ struct Data {
     alloc_size: u64,
     /// The base address; 0 for a protected surface.
     base: u64,
+    /// Each device's base anchor (module docs), by the device's ID. Declared before `memory`, so
+    /// the anchors go first.
+    anchors: Mutex<Vec<(u64, Anchor)>>,
     /// The memory it mapped, freed with the last holder of it.
     memory: Arc<Memory>,
     /// What it was made over ([`crate::os::surface_memory`] and the helpers beside it).
     made: Mutex<MadeOver>,
+    /// The declaration of its memory's writes ([`surface_declared`]), made with its first
+    /// buffer or texture; never for a surface not of its own memory.
+    declared: OnceLock<rt::DeclaredMemory>,
 }
 
 /// The memory a surface mapped: its own, or its view of the guest's pages; none for one over a
@@ -154,6 +225,116 @@ pub(crate) fn surface_memory_hold(surface: &LinuxSurface) -> impl Send + 'static
         .flatten()
         .map(|first| crate::remap::UnmapHold::new(first, data.alloc_size));
     (Arc::clone(memory), cores_unmap)
+}
+
+/// The declaration of the writes of `surface`'s memory (module docs, "Declared writes"), the
+/// same for each of its objects (lookups included), made at the first call, which the first
+/// buffer or texture over it makes; `None` for a surface not of its own memory: one over the
+/// guest's pages, which the guest writes, or a protected one, which maps none.
+pub(crate) fn surface_declared(surface: &LinuxSurface) -> Option<rt::DeclaredMemory> {
+    let data = surface.data();
+    let own = data.memory.own.is_some() && data.memory.view.is_none();
+    own.then(|| data.declared.get_or_init(rt::DeclaredMemory::new).clone())
+}
+
+/// Where a device is in making a surface's base anchor (module docs).
+#[derive(Debug)]
+enum Anchor {
+    /// One buffer over the base was made on the device.
+    Seen,
+    /// A second was, and the anchor is being made, by one thread alone.
+    Making,
+    /// The anchor, held for its drop.
+    Kept(#[expect(dead_code, reason = "the anchor is held for its drop")] BaseAnchor),
+    /// The device made none, and is never asked again.
+    Refused,
+}
+
+/// A surface's base anchor on a device: the platform's own buffer over its base address.
+struct BaseAnchor(rt::Buffer);
+
+/// The base anchors live in the process, a diagnostic ([`anchors_live`]).
+static ANCHORS_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+impl BaseAnchor {
+    /// The anchor `buffer`, counted live.
+    fn new(buffer: rt::Buffer) -> BaseAnchor {
+        ANCHORS_LIVE.fetch_add(1, Ordering::Relaxed);
+        BaseAnchor(buffer)
+    }
+}
+
+impl Drop for BaseAnchor {
+    fn drop(&mut self) {
+        ANCHORS_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl fmt::Debug for BaseAnchor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BaseAnchor({:#x} bytes)", self.0.length())
+    }
+}
+
+/// Whether the buffer over `surface`'s base address just made on the device `device` is its
+/// second there, so that the caller makes the surface's base anchor and hands it to
+/// [`keep_base_anchor`] (module docs). True once per surface and device: the first buffer is
+/// noted, and the second's caller alone is told to make it, so two threads never both make one.
+/// Always false for a surface over a single range of the guest's pages or a protected one, which
+/// maps no memory of its own, and nothing is noted for it.
+pub(crate) fn wants_base_anchor(surface: &LinuxSurface, device: u64) -> bool {
+    let data = surface.data();
+    if data.memory.own.is_none() && data.memory.view.is_none() {
+        return false;
+    }
+    let mut anchors = data.anchors.lock();
+    match anchors.iter().position(|(d, _)| *d == device) {
+        None => {
+            anchors.push((device, Anchor::Seen));
+            false
+        }
+        Some(i) => match anchors[i].1 {
+            Anchor::Seen => {
+                anchors[i].1 = Anchor::Making;
+                true
+            }
+            Anchor::Making | Anchor::Kept(_) | Anchor::Refused => false,
+        },
+    }
+}
+
+/// Keeps `anchor` as `surface`'s base anchor on the device `device`, which
+/// [`wants_base_anchor`] asked the caller to make, until the surface's last object goes; `None`,
+/// where the device made none, notes it refused, and none is asked again. What the slot held
+/// before is dropped after the lock is let go, so no buffer of the runtime's is dropped under it.
+pub(crate) fn keep_base_anchor(surface: &LinuxSurface, device: u64, anchor: Option<rt::Buffer>) {
+    let kept = anchor.map_or(Anchor::Refused, |buffer| {
+        Anchor::Kept(BaseAnchor::new(buffer))
+    });
+    let before = {
+        let mut anchors = surface.data().anchors.lock();
+        match anchors.iter().position(|(d, _)| *d == device) {
+            Some(i) => Some(std::mem::replace(&mut anchors[i].1, kept)),
+            None => {
+                anchors.push((device, kept));
+                None
+            }
+        }
+    };
+    drop(before);
+}
+
+/// The base anchors live in the process, a diagnostic (`crate::gpu::timing`'s trace).
+pub(crate) fn anchors_live() -> usize {
+    ANCHORS_LIVE.load(Ordering::Relaxed)
+}
+
+/// Whether `surface` keeps a base anchor on the device `device`.
+#[cfg(test)]
+pub(crate) fn has_base_anchor(surface: &LinuxSurface, device: u64) -> bool {
+    (surface.data().anchors.lock())
+        .iter()
+        .any(|(d, a)| *d == device && matches!(a, Anchor::Kept(_)))
 }
 
 impl LinuxSurface {
@@ -227,6 +408,13 @@ impl Surface for LinuxSurface {
 
     fn base_address(&self) -> HostPtr {
         HostPtr::from_addr(self.data().base.to_usize())
+    }
+
+    /// The write is declared ([`surface_declared`]), where the surface's memory is.
+    fn cpu_wrote(&self) {
+        if let Some(declared) = self.data().declared.get() {
+            declared.did_write();
+        }
     }
 
     fn alloc_size(&self) -> u64 {
@@ -420,6 +608,37 @@ fn view(ranges: &[PhysicalMemoryRange], length: u64, read_only: bool) -> Option<
     Some(at.addr().to_u64())
 }
 
+/// Whether a backing of `planes` can be in device memory ([`super::vram`]): one plane, at its base,
+/// as an import of a dma-buf of it starts at its start.
+fn one_plane_at_its_base(planes: &[Plane]) -> bool {
+    matches!(planes, [plane] if plane.offset == 0)
+}
+
+/// The memory of a backing of `planes`, `alloc_size` bytes, whole pages: in device memory where
+/// `exporter` is given and takes it ([`one_plane_at_its_base`], [`OwnMemory::in_vram`]), logged,
+/// else a memfd's, logged where `exporter` refused it (module docs, "Memory").
+fn own_memory(alloc_size: u64, planes: &[Plane], exporter: Option<&Exporter>) -> Option<OwnMemory> {
+    let Some(exporter) = exporter else {
+        return OwnMemory::new(alloc_size);
+    };
+    let placed = if one_plane_at_its_base(planes) {
+        OwnMemory::in_vram(alloc_size, exporter)
+    } else {
+        Err(vram::Refused::Planes)
+    };
+    match placed {
+        Ok(own) => {
+            vram::placed(own.first(), alloc_size);
+            Some(own)
+        }
+        Err(why) => {
+            let own = OwnMemory::new(alloc_size)?;
+            vram::refused(&why, own.first(), alloc_size);
+            Some(own)
+        }
+    }
+}
+
 /// IOSurface's creation on Linux (module docs).
 #[derive(Debug, Default)]
 pub struct LinuxSurfaces;
@@ -494,11 +713,13 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
             protection_options: protection,
             alloc_size: spec.alloc_size,
             base: if base == 0 { 0 } else { base + spec.offset },
+            anchors: Mutex::new(Vec::new()),
             memory: Arc::new(Memory {
                 own,
                 view: view_made,
             }),
             made: Mutex::new(made),
+            declared: OnceLock::new(),
         }))
     }
 
@@ -528,7 +749,7 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
         if alloc_size == 0 || alloc_size > physical_memory() {
             return None;
         }
-        let own = OwnMemory::new(alloc_size)?;
+        let own = own_memory(alloc_size, &planes, vram::exporter())?;
         Some(LinuxSurface::new(Data {
             pixel_format: spec.pixel_format,
             width,
@@ -539,11 +760,13 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
             protection_options: 0,
             alloc_size,
             base: own.first(),
+            anchors: Mutex::new(Vec::new()),
             memory: Arc::new(Memory {
                 own: Some(own),
                 view: None,
             }),
             made: Mutex::new(MadeOver::default()),
+            declared: OnceLock::new(),
         }))
     }
 
@@ -922,6 +1145,66 @@ mod tests {
         free(at, 2 * page);
     }
 
+    /// A surface of its own memory, made either way, declares its memory's writes as its first
+    /// buffer or texture asks: one declaration for all its objects (a lookup's included), one
+    /// for each surface. One over the guest's pages, of one range or a view of several, and a
+    /// protected one declare nothing, and a CPU write told them is nothing
+    #[test]
+    fn surfaces_of_their_own_memory_declare_their_writes() {
+        let surfaces = LinuxSurfaces::new();
+        let own = surfaces.create(&host_only()).unwrap();
+        let lookup = own.lookup_by_port().unwrap();
+        own.cpu_wrote();
+        assert!(own.data().declared.get().is_none(), "made as a buffer asks");
+        let plane = BackingPlaneSpec {
+            width: 16,
+            height: 16,
+            bytes_per_element: 4,
+            bytes_per_row: 64,
+            base: 0,
+            offset: 0,
+        };
+        let backing = surfaces
+            .create_backing(&BackingSurfaceSpec {
+                pixel_format: BGRA,
+                planes: vec![plane],
+                width: 16,
+                height: 16,
+            })
+            .unwrap();
+        surface_declared(&own).unwrap().withdraw();
+        own.cpu_wrote();
+        assert!(surface_declared(&own).unwrap().is_withdrawn());
+        assert!(
+            surface_declared(&lookup).unwrap().is_withdrawn(),
+            "the lookup's is the same"
+        );
+        assert!(
+            !surface_declared(&backing).unwrap().is_withdrawn(),
+            "each surface's is its own"
+        );
+        let page = page_size();
+        let (at, ranges) = guest_pages(2);
+        let over = |ranges: &[PhysicalMemoryRange]| SurfaceSpec {
+            alloc_size: page,
+            client_address_ranges: Some(ranges.to_vec()),
+            ..host_only()
+        };
+        let one = surfaces.create(&over(&ranges[..1])).unwrap();
+        let several = surfaces.create(&over(&ranges)).unwrap();
+        let protected = SurfaceSpec {
+            protection_options: 1,
+            ..host_only()
+        };
+        let protected = surfaces.create(&protected).unwrap();
+        for s in [&one, &several, &protected] {
+            s.cpu_wrote();
+            assert!(surface_declared(s).is_none());
+        }
+        drop((one, several));
+        free(at, 2 * page);
+    }
+
     /// A surface made from plane properties is its planes' whole pages, 1 byte per element and
     /// rows of its width rounded up to 128 bytes
     #[test]
@@ -973,5 +1256,209 @@ mod tests {
             ..spec
         };
         assert!(surfaces.create_backing(&huge).is_none());
+    }
+
+    /// A surface of its own memory, and a view of the guest's pages, asks for its base anchor on
+    /// a device once, at its second buffer there, each device on its own, a lookup of it as the
+    /// surface; one over a single range of the guest's pages, and a protected one, never asks
+    /// and notes nothing
+    #[test]
+    fn a_base_anchor_is_wanted_at_the_second_buffer_alone() {
+        let page = page_size();
+        let (at, ranges) = guest_pages(3);
+        let surfaces = LinuxSurfaces::new();
+        let view = SurfaceSpec {
+            alloc_size: 2 * page,
+            client_address_ranges: Some(ranges[..2].to_vec()),
+            ..host_only()
+        };
+        for spec in [host_only(), view] {
+            let s = surfaces.create(&spec).unwrap();
+            let asked: Vec<bool> = (0..3).map(|_| wants_base_anchor(&s, 1)).collect();
+            assert_eq!(asked, [false, true, false], "{spec:?}");
+            let other: Vec<bool> = (0..3).map(|_| wants_base_anchor(&s, 2)).collect();
+            assert_eq!(other, [false, true, false], "another device, {spec:?}");
+            let t = s.lookup_by_port().unwrap();
+            assert!(!wants_base_anchor(&t, 1), "a lookup, {spec:?}");
+            assert_eq!(s.retain_count(), 1, "{spec:?}");
+        }
+        let one = SurfaceSpec {
+            alloc_size: page,
+            client_address_ranges: Some(ranges[2..].to_vec()),
+            ..host_only()
+        };
+        let protected = SurfaceSpec {
+            protection_options: 1,
+            ..host_only()
+        };
+        for spec in [one, protected] {
+            let s = surfaces.create(&spec).unwrap();
+            assert!((0..3).all(|_| !wants_base_anchor(&s, 1)), "{spec:?}");
+            assert!(s.data().anchors.lock().is_empty(), "{spec:?}");
+        }
+        free(at, 3 * page);
+    }
+
+    /// A device that made no anchor is noted refused and never asked again, and the surface keeps
+    /// none
+    #[test]
+    fn a_refused_base_anchor_is_never_asked_again() {
+        let s = LinuxSurfaces::new().create(&host_only()).unwrap();
+        assert!(!wants_base_anchor(&s, 1));
+        assert!(wants_base_anchor(&s, 1));
+        keep_base_anchor(&s, 1, None);
+        assert!(!has_base_anchor(&s, 1));
+        assert!((0..3).all(|_| !wants_base_anchor(&s, 1)));
+        assert!(matches!(
+            s.data().anchors.lock()[..],
+            [(1, Anchor::Refused)]
+        ));
+    }
+
+    /// A backing of 64 × 32 BGRA texels, one plane at its base, as core makes it.
+    fn one_plane_backing() -> BackingSurfaceSpec {
+        BackingSurfaceSpec {
+            pixel_format: BGRA,
+            planes: vec![BackingPlaneSpec {
+                width: 64,
+                height: 32,
+                bytes_per_element: 4,
+                bytes_per_row: 256,
+                base: 0,
+                offset: 0,
+            }],
+            width: 64,
+            height: 32,
+        }
+    }
+
+    /// Whether `s`'s memory is a dma-buf of device memory ([`super::super::vram`]).
+    fn in_vram(s: &LinuxSurface) -> bool {
+        let base = s.base_address().addr().to_u64();
+        let pieces = super::super::files::pieces(base, page_size()).unwrap();
+        super::super::vram::tests::listed(&pieces[0].backing.fd)
+    }
+
+    /// Under the switch, a backing of one plane at its base is in device memory, and answers as
+    /// one in a memfd does: its allocation, rows, planes and page-aligned base, zeros first
+    #[test]
+    fn a_backing_in_vram_answers_as_one_in_a_memfd() {
+        let surfaces = LinuxSurfaces::new();
+        let memfd = surfaces.create_backing(&one_plane_backing()).unwrap();
+        let exporter = super::super::vram::tests::test_exporter();
+        let vram = vram::with_exporter(exporter, || {
+            surfaces.create_backing(&one_plane_backing()).unwrap()
+        });
+        assert!(in_vram(&vram) && !in_vram(&memfd));
+        let answers = |s: &LinuxSurface| {
+            (
+                s.alloc_size(),
+                s.bytes_per_element(),
+                s.bytes_per_row(),
+                s.plane_count(),
+                plane_at(s, 0),
+                plane_shape(s, 0),
+                s.base_address().addr().to_u64() % page_size(),
+            )
+        };
+        assert_eq!(answers(&vram), answers(&memfd));
+        assert_eq!(read(vram.base_address().addr().to_u64()), 0);
+        assert!(surface_declared(&vram).is_some(), "its own memory");
+    }
+
+    /// Under the switch, a backing of two planes, or of one not at its base, stays in a memfd,
+    /// the refusal counted
+    #[test]
+    fn a_backing_of_two_planes_stays_in_a_memfd() {
+        let mut two = one_plane_backing();
+        two.planes.push(BackingPlaneSpec {
+            width: 32,
+            height: 16,
+            bytes_per_element: 2,
+            bytes_per_row: 64,
+            base: 0x2000,
+            offset: 0x2000,
+        });
+        let mut inside = one_plane_backing();
+        inside.planes[0].base = 0x1000;
+        inside.planes[0].offset = 0x1000;
+        let exporter = super::super::vram::tests::test_exporter();
+        for spec in [two, inside] {
+            let refusals = super::super::vram::live().refusals;
+            let s = vram::with_exporter(exporter, || {
+                LinuxSurfaces::new().create_backing(&spec).unwrap()
+            });
+            assert!(!in_vram(&s), "{spec:?}");
+            assert!(super::super::vram::live().refusals > refusals, "{spec:?}");
+        }
+    }
+
+    /// Without the switch, which the tests' environment leaves unset, a backing is a memfd's
+    #[test]
+    fn without_the_switch_backings_stay_in_memfds() {
+        let s = LinuxSurfaces::new()
+            .create_backing(&one_plane_backing())
+            .unwrap();
+        assert!(!in_vram(&s));
+    }
+
+    /// A backing whose dma-buf would pass the budget is a memfd's, refused with nothing held
+    #[test]
+    fn the_switch_falls_back_to_a_memfd_past_its_budget() {
+        use super::super::vram::tests::{exporter_with_budget, reserved};
+        let exporter = exporter_with_budget(0);
+        let refusals = super::super::vram::live().refusals;
+        let s = vram::with_exporter(exporter, || {
+            LinuxSurfaces::new()
+                .create_backing(&one_plane_backing())
+                .unwrap()
+        });
+        assert!(!in_vram(&s));
+        assert_eq!(reserved(exporter), 0);
+        assert!(super::super::vram::live().refusals > refusals);
+    }
+
+    /// A backing's device memory stays held while a hold on its memory lives, the surface gone,
+    /// and its bytes return to the budget when the hold goes
+    #[test]
+    fn a_vram_backings_bytes_return_to_the_budget_when_its_last_hold_goes() {
+        use super::super::vram::tests::{exporter_with_budget, reserved};
+        let exporter = exporter_with_budget(1 << 30);
+        let s = vram::with_exporter(exporter, || {
+            LinuxSurfaces::new()
+                .create_backing(&one_plane_backing())
+                .unwrap()
+        });
+        assert!(in_vram(&s));
+        let held = s.alloc_size();
+        assert_eq!(reserved(exporter), held);
+        let hold = surface_memory_hold(&s);
+        let base = s.base_address();
+        drop(s);
+        assert!(mapped(base));
+        assert_eq!(reserved(exporter), held, "the hold keeps it");
+        drop(hold);
+        assert!(!mapped(base));
+        assert_eq!(reserved(exporter), 0);
+    }
+
+    /// Of threads that each note buffers over one surface's base at once, one alone is told to
+    /// make its anchor
+    #[test]
+    fn racing_buffers_tell_one_caller_to_make_the_anchor() {
+        let s = LinuxSurfaces::new().create(&host_only()).unwrap();
+        let told = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..100 {
+                        if wants_base_anchor(&s, 1) {
+                            told.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(told.load(Ordering::Relaxed), 1);
     }
 }

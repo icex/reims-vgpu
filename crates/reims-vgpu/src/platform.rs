@@ -51,6 +51,13 @@ pub trait ApiPlatform: Platform {
     /// `bytes_per_row` after the last. The caller has checked that `dst` holds them.
     fn read_pixels(&self, texture: &Self::Texture, dst: &mut [u8], bytes_per_row: usize);
 
+    /// Optional readback storage for an API frame target. Its copy is encoded after the
+    /// display's render in the same command buffer, so waiting for the frame also waits for
+    /// the pixels. Platforms without a separate copy keep reading the texture directly.
+    fn frame_pixels(&self, _texture: &Self::Texture) -> Option<Box<dyn FramePixels<Self>>> {
+        None
+    }
+
     /// What the platform holds of the guest's RAM while a device made over `map` lives: the
     /// device takes it as it is created and drops it after core's teardown. Nothing by default.
     fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
@@ -58,6 +65,20 @@ pub trait ApiPlatform: Platform {
         Box::new(())
     }
 }
+
+/// A frame target's optional pixel copy, held as long as its texture. Encoding never submits
+/// or waits: the frame's own commit and completion order the render and this copy together.
+pub trait FramePixels<P: Platform>: Send + Sync {
+    /// Append the full target's pixel copy after rendering, before the buffer is committed.
+    fn encode(&self, command_buffer: &P::CommandBuffer, texture: &P::Texture);
+
+    /// Read the pixels copied so far. The caller checked the output layout and waits for any
+    /// frames whose pixels it needs, as it does when reading the target texture directly.
+    fn read(&self, dst: &mut [u8], bytes_per_row: usize);
+}
+
+pub(crate) type FramePixelsFactory<P> =
+    fn(&P, &<P as Platform>::Texture) -> Option<Box<dyn FramePixels<P>>>;
 
 /// The API's state for one platform instance.
 pub(crate) struct ApiState<P: Platform> {

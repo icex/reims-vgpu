@@ -76,6 +76,7 @@ use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::plain;
 use crate::gpu::resource::{Alone, BufferObject, HeapObject};
+use crate::gpu::timing;
 use crate::gpu::writes::Memory;
 
 /// A texture's life ([`TextureObject::life`](crate::gpu::resource::TextureObject::life)): alive
@@ -181,21 +182,31 @@ impl Seen {
     /// Keeps a command's use of `memory`, unless a use kept holds all of it already: that one
     /// was kept, and its stamp moved, before this one could see it (module docs).
     fn keep(&self, memory: &[Range<u64>]) {
-        {
+        let start = timing::span_start();
+        let (after, held) = {
             let mut uses = self.uses.lock();
             if memory.iter().all(|m| holding(&uses, m)) {
-                return;
+                (uses.len(), true)
+            } else {
+                merge_all(&mut uses, memory);
+                let paged = self.paged.lock();
+                let pages = &paged.pages;
+                if !paged.zeroed && !pages.is_empty() && pages.iter().all(|p| holding(&uses, p)) {
+                    self.all_used.store(true, Ordering::Release);
+                }
+                (uses.len(), false)
             }
-            for used in memory {
-                merge(&mut uses, used.clone());
-            }
-            let paged = self.paged.lock();
-            let pages = &paged.pages;
-            if !paged.zeroed && !pages.is_empty() && pages.iter().all(|p| holding(&uses, p)) {
-                self.all_used.store(true, Ordering::Release);
-            }
+        };
+        if !held {
+            self.stamp.fetch_add(1, Ordering::SeqCst);
         }
-        self.stamp.fetch_add(1, Ordering::SeqCst);
+        // sp 35: the ranges kept, the uses after, whether they were held already; written with
+        // no lock held
+        timing::span(
+            35,
+            start,
+            &[memory.len().to_u64(), after.to_u64(), u64::from(held)],
+        );
     }
 
     /// The host memory commands used through the object, as kept.
@@ -217,6 +228,28 @@ fn merge(ranges: &mut Vec<Range<u64>>, mut merged: Range<u64>) {
     });
     let at = ranges.partition_point(|earlier| earlier.start < merged.start);
     ranges.insert(at, merged);
+}
+
+/// [`merge`] of each of `merged` into `ranges`, in turn. Where every range of both is
+/// non-empty, as the bytes of a command's use are, their union in one sort and one pass: the
+/// same ranges, which share no byte and touch none, as the turns give, without a scan of
+/// `ranges` per range merged.
+fn merge_all(ranges: &mut Vec<Range<u64>>, merged: &[Range<u64>]) {
+    let empty = |r: &Range<u64>| r.start >= r.end;
+    if merged.len() < 2 || merged.iter().chain(ranges.iter()).any(empty) {
+        for range in merged {
+            merge(ranges, range.clone());
+        }
+        return;
+    }
+    let mut all: Vec<Range<u64>> = ranges.drain(..).chain(merged.iter().cloned()).collect();
+    all.sort_unstable_by_key(|r| r.start);
+    for range in all {
+        match ranges.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => ranges.push(range),
+        }
+    }
 }
 
 /// Whether one of `ranges` ([`merge`]'s, in order) holds all of `range`.
@@ -278,10 +311,15 @@ impl Site {
 
     /// Host memory that stays while the texture lives: a surface's.
     pub(crate) fn fixed(memory: Vec<Range<u64>>) -> Site {
+        let start = timing::span_start();
+        let ranges = memory.len().to_u64();
+        let fixed = crate::remap::as_guests(memory);
+        // sp 30: the ranges given, named
+        timing::span(30, start, &[ranges, fixed.len().to_u64()]);
         Site {
             seen: None,
             bytes: 0..0,
-            fixed: crate::remap::as_guests(memory),
+            fixed,
         }
     }
 
@@ -496,13 +534,34 @@ impl Watch {
         texture: Texture,
         between: impl FnOnce(),
     ) -> Result<(), Clash> {
+        // The spans' times are read under the registry's lock, and their events written once it
+        // is let go, so no other thread waits on the trace's file.
+        let start = timing::span_start();
         let mut registry = self.registry.lock();
+        let locked = timing::span_start();
+        let counts =
+            |registry: &Registry| [registry.apart.len(), registry.others.len()].map(ToU64::to_u64);
+        let before = counts(&registry);
         let memory = site.memory();
         let clash = registry.under(site.seen.as_ref(), &memory);
+        let checked = timing::span_start();
         between();
+        let keeping = timing::span_start();
         if clash.is_ok() {
             registry.keep(Other { texture, site });
         }
+        let after = counts(&registry);
+        let kept = timing::span_start();
+        drop(registry);
+        let (ranges, clashed) = (memory.len().to_u64(), u64::from(clash.is_err()));
+        // sp 32: the textures kept apart, the others
+        timing::span_to(32, start, locked, &before);
+        // sp 33: the ranges checked, whether they lie under a texture kept apart
+        timing::span_to(33, locked, checked, &[ranges, clashed]);
+        // sp 34: the textures kept apart, the others after
+        timing::span_to(34, keeping, kept, &after);
+        // sp 31: the ranges checked, whether they lie under a texture kept apart
+        timing::span_to(31, start, kept, &[ranges, clashed]);
         clash
     }
 
@@ -668,6 +727,44 @@ pub(crate) fn moved(sel: &'static str, seen: &Arc<Seen>) {
 #[expect(clippy::single_range_in_vec_init, reason = "lists of host ranges")]
 mod tests {
     use super::*;
+
+    /// The union of a command's ranges at once is the same ranges as their merges in turn,
+    /// over random uses and ranges: overlapping, touching, apart, out of order, repeated, and
+    /// empty ones, which take the turns
+    #[test]
+    fn merging_all_at_once_is_merging_in_turn() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for round in 0..4000 {
+            let mut turns: Vec<Range<u64>> = Vec::new();
+            for _ in 0..next(6) {
+                let start = next(64);
+                merge(&mut turns, start..start + 1 + next(8));
+            }
+            let mut at_once = turns.clone();
+            let merged: Vec<Range<u64>> = (0..next(7))
+                .map(|_| {
+                    let start = next(64);
+                    let length = if round % 9 == 0 {
+                        next(3)
+                    } else {
+                        1 + next(10)
+                    };
+                    start..start + length
+                })
+                .collect();
+            for range in &merged {
+                merge(&mut turns, range.clone());
+            }
+            merge_all(&mut at_once, &merged);
+            assert_eq!(at_once, turns, "{merged:?}");
+        }
+    }
 
     /// A stand-in heap or buffer over `pages`.
     fn seen(pages: &[Range<u64>]) -> Arc<Seen> {

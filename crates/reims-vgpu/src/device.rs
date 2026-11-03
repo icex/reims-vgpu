@@ -260,6 +260,7 @@ pub struct Device<P: Platform = DefaultPlatform> {
     pub(crate) handle: Ours<CoreDevice<P>>,
     /// The platform the device was made on.
     platform: Arc<P>,
+    frame_pixels: crate::platform::FramePixelsFactory<P>,
     /// The platform's lease on the guest's RAM, for a device made over a memory map. Declared
     /// after `handle`, so a reference drops it after its core handle: the last drop, core's
     /// teardown among them, runs before the lease goes.
@@ -307,6 +308,7 @@ impl<P: ApiPlatform> Device<P> {
                 Ok(handle) => Ok(Device {
                     handle: Ours::new(handle),
                     platform: platform.clone(),
+                    frame_pixels: P::frame_pixels,
                     guest_memory,
                 }),
                 Err(refusal) => Err(refusal.into()),
@@ -330,6 +332,7 @@ impl<P: Platform> Device<P> {
         Device {
             handle: Ours::new(self.handle.clone_ref()),
             platform: self.platform.clone(),
+            frame_pixels: self.frame_pixels,
             guest_memory: self.guest_memory.clone(),
         }
     }
@@ -458,6 +461,7 @@ impl<P: Platform> Device<P> {
             width,
             height,
             format,
+            self.frame_pixels,
         )
     }
 }

@@ -1176,6 +1176,11 @@ pub(crate) fn render_pipeline_of(
 ) -> VulkanRenderPipeline {
     let unique_identifier =
         crate::gpu::unique_id::next_of(raw.device().registry_id(), raw.gpu_resource_id().0);
+    if reims_vgpu_core::trace::on()
+        && let Some(key) = raw.diagnostic_base_pipeline_key()
+    {
+        reims_vgpu_core::trace::event_text("gpipeline", &[unique_identifier], &key);
+    }
     Obj::new(RenderPipelineObject {
         raw,
         unique_identifier,

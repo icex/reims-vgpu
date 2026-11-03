@@ -19,7 +19,10 @@
 //!   one Mach refuses reports pages that did not change, which only has a later buffer over
 //!   them import them anew), and fresh ranges, which may lie where others were freed
 //!   (`allocate_anywhere`). Each reports the pages the call changes, from the page of its first
-//!   byte to the page past its last. `protect_max` changes no pages.
+//!   byte to the page past its last, but a remap into the pages of the range `allocate_anywhere`
+//!   just answered on the same thread, which no call changed since: those were reported at the
+//!   allocation, and no buffer can lie over them before their caller hands the address out
+//!   ([`FRESH`]), so a report would find no import there. `protect_max` changes no pages.
 //! - **The host's task and memory blocks** in a device without a memory map ([`reporting`],
 //!   `Platform::host_blocks`), where the host does the mapping work: `createTask` reports its
 //!   task's whole range, as the host may hand back addresses it freed before; `mapMemory` the
@@ -106,7 +109,8 @@
 //!   pages it imported, as Metal's reads those it wired. A driver that validates such pages again
 //!   at each submission fails a submission that lists the import in that window: on Linux the
 //!   surface stand-in's own memory and views (`os::linux::surface`) are therefore held until the
-//!   free, by the keep-alive of a buffer over a surface at no offset (`surface_memory_hold`). A
+//!   free, by the keep-alive of a buffer over a surface at no offset (`surface_memory_hold`), the
+//!   surface's base anchor's among them, which goes with the surface's last object. A
 //!   surface over a single range of the guest's pages maps nothing: core makes one only over a
 //!   page of the host's own RAM ("Not reported", above), which no hold defers, and the
 //!   [`UnmapHold`] its hold carries defers an unmap only of pages [`VulkanVm`] maps.
@@ -128,6 +132,7 @@ use std::sync::Arc;
 use reims_vgpu_core::host::{
     CreateTask, DestroyTask, HostBlocks, HostPtr, HostTask, MapMemory, UnmapMemory,
 };
+use reims_vgpu_core::memory::kept::KeptLimits;
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
 use reims_vgpu_core::sync::Mutex;
@@ -259,6 +264,18 @@ pub(crate) fn shows_guest_pages(first: HostPtr, length: u64) -> bool {
     !memory.is_empty() && GUEST_MAPPINGS.lock().shows(&memory)
 }
 
+/// What a task keeps of the mappings its transfer buffers were made over, on Linux
+/// ([`VulkanVm`]'s `kept_mapping_limits`, core's `memory::kept`). A Finder drag on macOS 26
+/// bound 1,860 transfer buffers over 180 distinct runs of pages in 6 s: 256 mappings hold them.
+/// The bytes are address space alone (the views map the guest's own pages), and the runs at most
+/// as many kernel mappings, an eighth of the views' share of the default `vm.max_map_count`,
+/// which a view that would pass the budget takes back first.
+pub(crate) const KEPT_MAPPINGS: KeptLimits = KeptLimits {
+    entries: 256,
+    bytes: 1 << 30,
+    runs: 6_144,
+};
+
 /// The process's holds on pages runtime imports cover, and the unmaps that wait for them
 /// ([`UnmapHold`]). A leaf lock: nothing is called under it.
 static HOLDS: Mutex<Holds> = Mutex::new(Holds::new());
@@ -331,7 +348,9 @@ impl VulkanVm {
 
     /// Reports the pages a call over `len` bytes at `addr` changed, which show none of the
     /// guest's pages from now on unless a remap says so after ([`GuestMappings`]): their range.
+    /// The calling thread's fresh range ([`FRESH`]) is no longer fresh.
     fn changed(&self, addr: HostAddr, len: u64) -> Range<u64> {
+        FRESH.set(None);
         let (at, length) = pages(addr, len, self.vm.page_size());
         let first = at.addr().to_u64();
         GUEST_MAPPINGS
@@ -339,6 +358,28 @@ impl VulkanVm {
             .unmapped(first, first.saturating_add(length));
         (self.report)(at, length);
         first..first.saturating_add(length)
+    }
+}
+
+thread_local! {
+    /// The pages of the range `allocate_anywhere` last answered on this thread that no call has
+    /// changed since, from the first to the end: reported at the allocation, and seen by no one
+    /// but the caller, which has not handed the address out while it remaps pieces of guest pages
+    /// into it in order (core's range mappings). A remap into them reports nothing more, as no
+    /// import can lie there, so the report would find none; it takes its pages out (module
+    /// docs). Any other call that changes pages on the thread ends it.
+    static FRESH: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the pages `first..end` lie in this thread's fresh range ([`FRESH`]), which then
+/// starts past them.
+fn into_fresh(first: u64, end: u64) -> bool {
+    match FRESH.get() {
+        Some((from, to)) if from <= first && first < end && end <= to => {
+            FRESH.set(Some((end, to)));
+            true
+        }
+        _ => false,
     }
 }
 
@@ -359,7 +400,10 @@ impl HostVm for VulkanVm {
 
     fn allocate_anywhere(&self, len: u64) -> Result<HostAddr, KernReturn> {
         let at = self.vm.allocate_anywhere(len)?;
-        self.changed(at, len);
+        let fresh = self.changed(at, len);
+        if !fresh.is_empty() {
+            FRESH.set(Some((fresh.start, fresh.end)));
+        }
         Ok(at)
     }
 
@@ -384,16 +428,25 @@ impl HostVm for VulkanVm {
         src: HostAddr,
         len: u64,
     ) -> Result<HostAddr, KernReturn> {
-        let at = self.vm.remap_shared_overwrite(dst, src, len)?;
+        let at = self.vm.remap_shared_overwrite(dst, src, len);
         // The kernel maps the source's pages, from the page of its first byte: as many bytes
         // past `dst` as the source's offset in its page, and `len` more.
         let mask = self.vm.page_size().wrapping_sub(1);
         let offset = src.addr().to_u64() & mask;
-        let replaced = self.changed(dst, len.saturating_add(offset));
-        HOLDS.lock().replaced(&replaced);
-        // Those pages are one of core's mappings of the guest's (module docs).
         let (first, length) = pages(dst, len.saturating_add(offset), self.vm.page_size());
         let first = first.addr().to_u64();
+        let fresh = at.is_ok() && into_fresh(first, first.saturating_add(length));
+        if !fresh {
+            FRESH.set(None);
+        }
+        let at = at?;
+        // Pages of a fresh range were reported at its allocation, and no import lies there
+        // ([`FRESH`]).
+        if !fresh {
+            let replaced = self.changed(dst, len.saturating_add(offset));
+            HOLDS.lock().replaced(&replaced);
+        }
+        // Those pages are one of core's mappings of the guest's (module docs).
         let source = src.addr().to_u64() & !mask;
         GUEST_MAPPINGS
             .lock()
@@ -403,6 +456,20 @@ impl HostVm for VulkanVm {
 
     fn protect_max(&self, addr: HostAddr, len: u64, prot: VmProt) -> Result<(), KernReturn> {
         self.vm.protect_max(addr, len, prot)
+    }
+
+    /// On Linux, as many as [`KEPT_MAPPINGS`]: a mapping core makes of the memory map's pages is
+    /// a view of the guest RAM's files through the backing table's registrations, fixed while the
+    /// device lives (`os::linux::files`), so a fresh one shows exactly what a kept one does, and a
+    /// page the host drops from its file shows in both alike. A view that would pass the budget
+    /// of mappings lets the kept ones go first (`os::linux::budget`). On macOS none: Mach's remap
+    /// aliases the host's memory as it is at the call.
+    fn kept_mapping_limits(&self) -> KeptLimits {
+        if cfg!(target_os = "linux") {
+            KEPT_MAPPINGS
+        } else {
+            KeptLimits::NONE
+        }
     }
 
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn {
@@ -553,6 +620,39 @@ mod tests {
         // The source is no longer mapped: the remap fails, and changes nothing.
         assert!(vm.remap_shared_overwrite(src, at, page).is_err());
         assert_eq!(take(), []);
+        assert!(OsVm::new().deallocate(src, 2 * page).is_success());
+    }
+
+    /// A remap into the pages `allocate_anywhere` just answered on the thread, in order, reports
+    /// nothing more: they were reported at the allocation, and no import can lie there; a remap
+    /// over pages remapped already, or after another call changed pages, reports as any does
+    #[test]
+    fn a_remap_into_a_fresh_range_reports_nothing_more() {
+        let vm = VulkanVm {
+            vm: OsVm::new(),
+            report: seen,
+        };
+        let page = vm.page_size();
+        let src = crate::os::allocate_aliasable(2 * page).unwrap();
+        let _ = take();
+        let at = vm.allocate_anywhere(3 * page).unwrap();
+        assert_eq!(take(), [(at, 3 * page, true)]);
+        vm.remap_shared_overwrite(at, src, page).unwrap();
+        vm.remap_shared_overwrite(at.wrapping_add(page), src.wrapping_add(page), page)
+            .unwrap();
+        assert_eq!(take(), []);
+        vm.protect_max(at, 2 * page, VmProt::READ).unwrap();
+        // Over the first page again: not fresh any more
+        vm.remap_shared_overwrite(at, src, page).unwrap();
+        assert_eq!(take(), [(at, page, true)]);
+        // Nor the third, once another call changed pages
+        vm.remap_shared_overwrite(at.wrapping_add(2 * page), src, page)
+            .unwrap();
+        assert_eq!(take(), [(at.wrapping_add(2 * page), page, true)]);
+        assert!(vm.deallocate(at, 3 * page).is_success());
+        assert_eq!(take(), [(at, 3 * page, true)]);
+        // The pages remapped into the fresh range are named by the source's
+        assert!(!shows_guest_pages(at, 3 * page));
         assert!(OsVm::new().deallocate(src, 2 * page).is_success());
     }
 

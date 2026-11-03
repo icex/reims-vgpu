@@ -162,12 +162,22 @@ reims-vgpu-vulkan  <-  reims-vgpu, reims-vgpu-c  (their `vulkan` feature: off by
   its public repository `Cargo.toml` names, on the host's Vulkan driver, or MoltenVK on a Mac. On
   macOS it takes its OS services (IOSurfaces, Mach VM, the clock, threads) from the metal crate;
   on Linux it has its own (`os/linux/`: a host VM over `mmap` of the guest RAM's files, and an
-  IOSurface stand-in over that memory). The API's and the C API's `vulkan` features take it
+  IOSurface stand-in over that memory, which from a surface's second buffer over its base on a
+  device keeps one buffer of the platform's own there, its base anchor, so that buffers the guest
+  makes over it one after another join one import of the runtime's; under
+  `REIMS_VGPU_VRAM_SURFACES=1` a backing's memory is a dma-buf of device memory, whose imports are
+  duplicates of it in place of udmabufs). The API's and the C API's
+  `vulkan` features take it
   (10, 11.1): on Linux the library builds only with them, and on macOS `cargo xtask dist
   --platform vulkan` builds a tree on it (11.3), the Metal platform staying the product and the
   default. Where its answer differs from Metal's it logs the difference and goes on, and dies
   where Metal would or where the runtime cannot run the call (api.md section 2; the ledger,
   `docs/accuracy-ledger.md`). A method it has not built dies at its selector.
+  Its command buffers ask the runtime to group ready batches on one Vulkan queue into one
+  driver submission, with at most sixteen batches. A dependency on a signal inside the group
+  ends it first; grouping adds no wait for another commit. Each buffer keeps its completion
+  and event order, though a driver timeout or failure of that shared submission may affect
+  several buffers together. A buffer deliberately held for a simulated GPU hang goes alone.
 
 - **Core** depends on `parking_lot`, `zerocopy`, `bitflags` and `log` only (`loom` under
   `cfg(loom)`). Its `testkit` feature exposes `core::testkit` outside core's own tests; only
@@ -990,7 +1000,12 @@ section 3 has its types and signatures.
 - **The Vulkan platform** (feature `vulkan`, 2.2). `VulkanPlatform` is an `ApiPlatform` too:
   `singleton.rs` makes its one instance the same way, its devices are the runtime's (the default
   one, or the one whose registry ID a config names: Metal's for the default device, the runtime's
-  own for any other), and `read_pixels` reads the texture back through the runtime. On Linux it
+  own for any other). API frame targets optionally keep a host-cached pixel buffer: each frame
+  appends a full texture-to-buffer copy after rendering on the same command buffer. Frame
+  completion therefore includes that copy, and `read_pixels` copies its rows without another
+  submission or wait. This avoids CPU detiling from uncached device memory. Allocation refusal
+  keeps the direct texture readback. Other platforms use their direct readback by default. The
+  native window's swapchain does not use this API frame-target copy. On Linux the Vulkan platform
   is the default platform. A window display on it gets the host's screen as the window crate
   lists them, and a sink that draws into the window's swapchain ("Windows", below).
 - **Entries.** Every public method, and every release of a handle, runs inside `entry::run`:

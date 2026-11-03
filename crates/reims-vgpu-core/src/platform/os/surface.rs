@@ -36,6 +36,12 @@ pub trait Surface: Handle {
     fn unlock(&self, options: u32) -> KernReturn;
     /// `IOSurfaceGetBaseAddress`.
     fn base_address(&self) -> HostPtr;
+    /// The CPU wrote the surface's memory through [`base_address`](Self::base_address) (core's
+    /// test pattern): called after the write and before the next commit, so that a platform
+    /// that keeps GPU copies of the surface's bytes reads the write in the work committed after
+    /// it. IOSurface has no such call, as Metal's textures over a surface are its memory: a
+    /// platform over IOSurface does nothing.
+    fn cpu_wrote(&self);
     /// `IOSurfaceGetAllocSize`.
     fn alloc_size(&self) -> u64;
     /// `IOSurfaceLookupFromMachPort(IOSurfaceCreateMachPort(surface))`: another object over the

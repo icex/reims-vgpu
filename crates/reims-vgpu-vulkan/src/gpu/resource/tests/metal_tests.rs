@@ -3134,6 +3134,7 @@ fn rotated_uses<P: Platform<Surface = OsSurface>>(
     unsafe {
         std::ptr::copy_nonoverlapping(fill.as_ptr(), s.base_address().as_ptr::<u8>(), fill.len());
     }
+    s.cpu_wrote();
     let desc = p.texture_descriptor(&TextureDesc {
         pixel_format: 80,
         width: side,
@@ -3308,6 +3309,7 @@ fn rotated_named<P: Platform<Surface = OsSurface>>(
     unsafe {
         std::ptr::copy_nonoverlapping(fill.as_ptr(), s.base_address().as_ptr::<u8>(), fill.len());
     }
+    s.cpu_wrote();
     let desc = p.texture_descriptor(&TextureDesc {
         pixel_format: 80,
         width: side,

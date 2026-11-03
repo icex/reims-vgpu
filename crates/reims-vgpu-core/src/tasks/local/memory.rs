@@ -200,6 +200,19 @@ impl<P: Platform> LocalTask<P> {
         length: u64,
         need_writable: bool,
     ) -> RaiseResult<Option<Arc<Mapping<P>>>> {
+        self.mapping_of(hold, offset, length, need_writable, false)
+    }
+
+    /// [`LocalTask::virtual_mapping`]; with `keep`, the task's kept mapping of the same runs where
+    /// it has one, and the fresh one kept otherwise ([`crate::memory::kept`]): a transfer buffer's.
+    fn mapping_of(
+        &self,
+        hold: Hold<'_>,
+        offset: u64,
+        length: u64,
+        need_writable: bool,
+        keep: bool,
+    ) -> RaiseResult<Option<Arc<Mapping<P>>>> {
         check_mappable(offset, length, self.length, !self.task_root.is_null())?;
         let mut ranges: Vec<PhysRange> = Vec::new();
         let mut writable = true;
@@ -240,7 +253,14 @@ impl<P: Platform> LocalTask<P> {
             return Ok(None);
         }
         let memory_map = self.device.upgrade().and_then(|d| d.memory_map());
-        Ok(memory_map.and_then(|m| m.new_range_mapping(&ranges, length, u32::from(!writable))))
+        let read_only = u32::from(!writable);
+        Ok(memory_map.and_then(|m| {
+            if keep {
+                self.kept.mapping(&m, &ranges, length, read_only)
+            } else {
+                m.new_range_mapping(&ranges, length, read_only)
+            }
+        }))
     }
 
     /// The host address of task memory at `offset`, mapped for `length` bytes. In the map setup
@@ -296,9 +316,10 @@ impl<P: Platform> LocalTask<P> {
     }
 
     /// A no-copy buffer over the task's pages from `page`, `length` bytes. In the blocks setup
-    /// it wraps the host task's memory, with no deallocator; in the map setup a fresh mapping,
-    /// which the buffer's deallocator owns (and which is kept for good when Metal refuses the
-    /// buffer: its address space stays taken).
+    /// it wraps the host task's memory, with no deallocator; in the map setup a mapping, fresh or
+    /// the task's kept one of the same runs ([`crate::memory::kept`]), which the buffer's
+    /// deallocator holds (and which is kept for good when Metal refuses the buffer: its address
+    /// space stays taken).
     pub(super) fn buffer_for_page(
         &self,
         hold: Hold<'_>,
@@ -334,7 +355,7 @@ impl<P: Platform> LocalTask<P> {
                 None => None,
             }
         } else {
-            let Some(mapping) = self.virtual_mapping(hold, page_address(page), length, false)?
+            let Some(mapping) = self.mapping_of(hold, page_address(page), length, false, true)?
             else {
                 return raise_caught(
                     RaiseKind::NullAddress,
@@ -425,6 +446,8 @@ impl<P: Platform> LocalTask<P> {
         let mut remaining = dst.len().to_u64();
         let mut current: usize = 0;
         let device = self.device.upgrade();
+        // Read once: the device's map stays while the device lives
+        let map = device.as_ref().and_then(|d| d.memory_map());
         let Some(walker) = &self.walker else {
             return Ok(());
         };
@@ -439,7 +462,9 @@ impl<P: Platform> LocalTask<P> {
             // `current + remaining` is `dst`'s length throughout, so the part is inside it
             let into = dst.get_mut(current..to).unwrap_or_default();
             let read = match &device {
-                Some(d) => d.read_from_physical_address(on, physical, into)?,
+                Some(d) => {
+                    d.read_from_physical_address_through(map.as_deref(), on, physical, into)?
+                }
                 None => false,
             };
             // A failed read is silent: the position does not advance, and the next page is read

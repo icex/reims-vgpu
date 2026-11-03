@@ -435,8 +435,11 @@ expected values by them.
   `REIMS_VGPU_LOG` and `REIMS_VGPU_STATS`, diagnostics that change nothing
   the guest or host observes; the `REIMS_VGPU_WINDOW_*` variables, which
   only a display with a window reads, and the runner makes none; and the
-  Vulkan platform's `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT` and
-  `REIMS_VGPU_CENSUS_DIR`, which the Metal platform never reads. Nothing
+  Vulkan platform's `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT`,
+  `REIMS_VGPU_CENSUS_DIR` and `REIMS_VGPU_VRAM_SURFACES`, which the Metal
+  platform never reads. The runner sets none of them; the last stays off for
+  the suite and for runs that fault the GPU, as a reset that loses device
+  memory loses the bytes of the backings it placed there. Nothing
   reads `NSUserDefaults` or `sysctl`, and there are no `@available` or
   OS-version branches. Whether a host gives a
   memory map or the task callbacks is the host's choice: QEMU's

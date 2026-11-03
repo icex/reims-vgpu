@@ -334,7 +334,8 @@ impl<P: Platform> HostDeviceCore<P> {
 
     /// Writes each 8-byte word of the surface's allocation with its own offset, from byte 0 of
     /// the allocation (the base address less the descriptor's offset), under the IOSurface's lock
-    /// (whose results are ignored).
+    /// (whose results are ignored), and tells the surface its CPU wrote it
+    /// ([`Surface::cpu_wrote`]) before the unlock.
     pub(super) fn test_pattern(&self, st: &QueueState<P>, mapping_id: u32) -> IoReturn {
         if mapping_id == 0 || u64::from(mapping_id) >= MAPPING_ID_COUNT {
             log::warn!("test: mapping id {mapping_id} is not in 1..{MAPPING_ID_COUNT}");
@@ -357,6 +358,7 @@ impl<P: Platform> HostDeviceCore<P> {
             let at = i.wrapping_mul(8);
             start.write_u64(at, at, DeathKind::PatternWrite);
         }
+        surface.cpu_wrote();
         let _ = surface.unlock(0);
         IoReturn::Success
     }
@@ -758,7 +760,8 @@ mod tests {
     }
 
     /// The test pattern: each 8-byte word of the allocation holds its own offset, under the
-    /// IOSurface's lock; out of range and empty slots are BadArgument.
+    /// IOSurface's lock, which the surface is told its CPU wrote before the unlock; out of range
+    /// and empty slots are BadArgument.
     #[test]
     fn test_pattern_fills_the_allocation() {
         let r = rig();
@@ -783,6 +786,7 @@ mod tests {
             assert_eq!(mem.read_u64(i * 8), Some(i * 8));
         }
         assert_eq!(surface.lock_count(), 0);
+        assert_eq!(surface.cpu_writes(), vec![1], "told once, while locked");
     }
 
     /// A rig with surface 1 guest-backed and held elsewhere too, and surface 2 host-only: the

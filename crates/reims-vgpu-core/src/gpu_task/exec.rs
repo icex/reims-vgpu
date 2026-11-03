@@ -26,6 +26,7 @@ use crate::resources::manager::states::ComputePipelineStates;
 use crate::resources::manager::states::RasterizationRateMaps;
 use crate::rt::{Held, Hold};
 use crate::tasks::wire::Reply;
+use crate::trace;
 
 /// How long an info waits for the previous exec to be scheduled.
 const INFO_WAIT_MS: u64 = 5000;
@@ -171,13 +172,21 @@ impl<P: Platform> GpuTask<P> {
         gpu_completion: u64,
         reply: &Reply<(u32, Option<Vec<u8>>, u32)>,
     ) {
+        let task = u64::from(self.id());
+        let waited = trace::span_start();
         let _lock = self.task_lock(Access::Shared);
+        let whole = trace::span_start();
+        // 40: the wait for the task's shared lock: the task
+        trace::span_to(40, waited, whole, &[task]);
+        let mapping = trace::span_start();
         if let Err(t) = self.ensure_object_list_mapped(hold) {
             log::warn!("task {}: exec refused: {}", self.id(), exception(&t));
             reply.call((2, None, 0));
             hold.land(t);
             return;
         }
+        // 41: the object lists' mapping: the task
+        trace::span(41, mapping, &[task]);
         if Self::command_too_big(data, resource_count, cmd_buffer_count) {
             log::warn!(
                 "task {}: exec refused: {resource_count} resources and {cmd_buffer_count} \
@@ -206,6 +215,7 @@ impl<P: Platform> GpuTask<P> {
             } else {
                 event.as_ref()
             };
+            let prepare = trace::span_start();
             let sync = self.prepare_resources(
                 hold,
                 resources,
@@ -213,6 +223,9 @@ impl<P: Platform> GpuTask<P> {
                 fifo_event_value_in,
                 &mut shared_texture_backing_ids,
             )?;
+            // 42: the preparation: the task, the resources listed
+            trace::span(42, prepare, &[task, u64::from(resource_count)]);
+            let made = trace::span_start();
             let command_queue = self.command_queue.lock().as_ref().map(Handle::clone_ref);
             let command_buffer = match &command_queue {
                 Some(q) => q.command_buffer(OnFault::Return)?,
@@ -232,12 +245,26 @@ impl<P: Platform> GpuTask<P> {
             {
                 b.encode_wait(event.as_ref().map(EventRef::Shared), fifo_event_value_in)?;
             }
+            // 47: the exec's command buffer and its wait: the task
+            trace::span(47, made, &[task]);
+            let copies = trace::span_start();
             // Live cursors over guest RAM
             let mut cursors = self.cursors(hold, cmd_buffers)?;
+            if copies.is_some() {
+                let bytes = (cmd_buffers.iter())
+                    .map(|b| b.length)
+                    .fold(0u64, u64::wrapping_add);
+                // 48: the cursors: the task, the command buffers and their bytes
+                trace::span(48, copies, &[task, cursors.len().to_u64(), bytes]);
+            }
             let (deserializer, _, _) = self.parts();
+            let decode = trace::span_start();
             // Held past the commit, to the end of the exec (`Decoders`).
             let _decoders =
                 deserializer.decode_segments(hold, &mut cursors, command_buffer.as_ref())?;
+            // 49: the decode: the task, the segments
+            trace::span(49, decode, &[task, cursors.len().to_u64()]);
+            let commit = trace::span_start();
             let this = Arc::clone(self);
             let needs_complete = sync.needs_complete;
             // The completion runs as the task's code, and not at all once the task has ended.
@@ -256,6 +283,8 @@ impl<P: Platform> GpuTask<P> {
             if let Some(b) = &command_buffer {
                 b.commit(OnFault::Return)?;
             }
+            // 50: the handler, the signal and the commit: the task
+            trace::span(50, commit, &[task]);
             let complete = CompleteSync {
                 needs_complete: sync.needs_complete,
                 event: complete_event,
@@ -267,7 +296,10 @@ impl<P: Platform> GpuTask<P> {
                 let synced: CompletedHandler = self.carry(move |sync_buffer: CompletedInfo| {
                     this.sync_completed(sync_buffer, exec_buffer, gpu_completion);
                 });
+                let paging_out = trace::span_start();
                 self.complete_resources(hold, resources, complete, synced)?;
+                // 51: the synchronize buffer: the task
+                trace::span(51, paging_out, &[task]);
             }
             Ok(())
         })();
@@ -285,6 +317,8 @@ impl<P: Platform> GpuTask<P> {
                 .collect::<Vec<u8>>()
         });
         reply.call((1, backing_ids, count));
+        // 52: the whole exec from its lock taken: the task
+        trace::span(52, whole, &[task]);
     }
 
     /// The exec buffer's completion, on a Metal thread: an error is 3; without paging-out

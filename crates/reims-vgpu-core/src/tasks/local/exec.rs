@@ -10,7 +10,7 @@ use super::{DeathKind, LocalTask, kernel_task};
 use crate::fifo::wire::Records;
 use crate::guest::records::CmdExecIndirectCmdBuffer;
 use crate::memory::cursor::Cursor;
-use crate::num::Truncate;
+use crate::num::{ToU64, Truncate};
 use crate::platform::blit::{BlitCmd, BlitEncoder};
 use crate::platform::command::{CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo};
 use crate::platform::compute::{ComputeCmd, ComputeEncoder};
@@ -25,6 +25,7 @@ use crate::resources::resource::Resource;
 use crate::rt::{Held, Hold};
 use crate::tasks::resource_list::ResourceList;
 use crate::tasks::{Completion, ExecStatus, Unsupported};
+use crate::trace;
 
 /// What the preparation hands the exec.
 pub(super) struct PrepareSync<P: Platform> {
@@ -69,6 +70,8 @@ impl<P: Platform> LocalTask<P> {
         event: Option<&P::SharedEvent>,
         value: u64,
     ) -> RaiseResult<PrepareSync<P>> {
+        let task = u64::from(self.task_id);
+        let whole = trace::span_start();
         let _prepare = self.prepare_mutex.lock();
         let mut sync = PrepareSync::<P> {
             needs_sync: false,
@@ -81,6 +84,7 @@ impl<P: Platform> LocalTask<P> {
         let mut cpu_resources: Vec<Arc<Resource<P>>> = Vec::new();
         let mut invalidated: Vec<(u32, Option<Arc<Resource<P>>>)> = Vec::new();
         let mut shared_texture_backings: Vec<u32> = Vec::new();
+        let lookups = trace::span_start();
         for i in 0..resources.count() {
             let resource = resources.get(i)?;
             // Made on first use; a raise abandons the rest
@@ -109,7 +113,11 @@ impl<P: Platform> LocalTask<P> {
                 sync.needs_complete = true;
             }
         }
+        let listed = resources.count();
+        // 43: the lookups: the task, the resources listed
+        trace::span(43, lookups, &[task, listed]);
         if !blit_resources.is_empty() || !compute_resources.is_empty() {
+            let setup = trace::span_start();
             let command_buffer = match &self.base.paging_queue {
                 Some(queue) => queue.command_buffer(OnFault::Return)?,
                 None => None,
@@ -122,12 +130,16 @@ impl<P: Platform> LocalTask<P> {
             sync.needs_sync = true;
             let mut blit_encoder: Option<P::BlitEncoder> = None;
             let mut compute_encoder: Option<P::ComputeEncoder> = None;
+            let mut page_ups = None;
             let mut prepared = (|| -> RaiseResult<_> {
                 if !blit_resources.is_empty() {
                     blit_encoder = match &command_buffer {
                         Some(buffer) => buffer.blit_encoder(OnFault::Return)?,
                         None => None,
                     };
+                    // 44: the paging buffer, its wait and its blit encoder: the task
+                    trace::span(44, setup, &[task]);
+                    page_ups = trace::span_start();
                     for r in &blit_resources {
                         r.prepare_in_encoder(hold, blit_encoder.as_ref())?;
                     }
@@ -137,6 +149,11 @@ impl<P: Platform> LocalTask<P> {
                     blit_encoder = None;
                 }
                 if !compute_resources.is_empty() {
+                    if page_ups.is_none() {
+                        // 44, as above, where no blit resource opened an encoder
+                        trace::span(44, setup, &[task]);
+                        page_ups = trace::span_start();
+                    }
                     compute_encoder = match &command_buffer {
                         Some(buffer) => buffer.compute_encoder(OnFault::Return)?,
                         None => None,
@@ -151,6 +168,11 @@ impl<P: Platform> LocalTask<P> {
                 }
                 Ok(())
             })();
+            // 45: the page-ups: the task, the blit and the compute resources
+            let blits = blit_resources.len().to_u64();
+            let computes = compute_resources.len().to_u64();
+            trace::span(45, page_ups, &[task, blits, computes]);
+            let signal = trace::span_start();
             // Whatever the prepares did: an encoder a raise left open is ended, the paging event
             // is signalled at the next counter value, and the buffer is committed; a raise here
             // goes on in place of the prepare's, which ends there
@@ -180,6 +202,8 @@ impl<P: Platform> LocalTask<P> {
                 hold.cleanup_step(&mut prepared, signalled)?;
                 hold.cleanup_step(&mut prepared, buffer.commit(OnFault::Return))?;
             }
+            // 46: the paging buffer's signal and commit: the task
+            trace::span(46, signal, &[task]);
             // Every caller is under a handler (an exec's or an info's): the raise goes on
             prepared?;
         }
@@ -222,6 +246,19 @@ impl<P: Platform> LocalTask<P> {
         crate::fatal_unless!(
             !sync.needs_sync || sync.event.is_some(),
             DeathKind::NoPagingEvent
+        );
+        // 42: the preparation: the task, the resources listed, then those paged by a blit, a
+        // compute encoder and the CPU
+        trace::span(
+            42,
+            whole,
+            &[
+                task,
+                listed,
+                blit_resources.len().to_u64(),
+                compute_resources.len().to_u64(),
+                cpu_resources.len().to_u64(),
+            ],
         );
         Ok(sync)
     }
@@ -383,12 +420,20 @@ impl<P: Platform> LocalTask<P> {
         fifo_event_value: &Arc<AtomicU64>,
         done: Completion,
     ) -> RaiseResult<()> {
+        let task = u64::from(self.task_id);
+        let waited = trace::span_start();
         let _lock = self.base.mutex.read();
+        let whole = trace::span_start();
+        // 40: the wait for the task's shared lock: the task
+        trace::span_to(40, waited, whole, &[task]);
         let (deserializer, _, lists) = self.parts();
+        let mapping = trace::span_start();
         if !lists.ensure_mapped(hold) {
             done(ExecStatus::FAIL, None);
             return Ok(());
         }
+        // 41: the object lists' mapping: the task
+        trace::span(41, mapping, &[task]);
         let executed = (|| -> RaiseResult<_> {
             let prepare_sync = self.prepare_resources(
                 hold,
@@ -396,6 +441,7 @@ impl<P: Platform> LocalTask<P> {
                 fifo_event,
                 fifo_event_value.load(Ordering::SeqCst),
             )?;
+            let made = trace::span_start();
             let queue = self.device.upgrade().and_then(|d| d.exec_queue());
             let command_buffer = match &queue {
                 Some(queue) => queue.command_buffer(OnFault::Return)?,
@@ -409,11 +455,26 @@ impl<P: Platform> LocalTask<P> {
                     prepare_sync.value,
                 )?;
             }
+            // 47: the exec's command buffer and its wait on the paging event: the task
+            trace::span(47, made, &[task]);
+            let copies = trace::span_start();
             // Every copy now, before the decode
             let mut cursors = self.cursors(hold, &cmd_buffers);
+            if copies.is_some() {
+                let bytes = cmd_buffers
+                    .iter()
+                    .map(|b| b.length)
+                    .fold(0u64, u64::wrapping_add);
+                // 48: the copies: the task, the command buffers and their bytes
+                trace::span(48, copies, &[task, cursors.len().to_u64(), bytes]);
+            }
+            let decode = trace::span_start();
             // Held past the commit, to the end of the exec (`Decoders`).
             let _decoders =
                 deserializer.decode_segments(hold, &mut cursors, command_buffer.as_ref())?;
+            // 49: the decode: the task, the segments
+            trace::span(49, decode, &[task, cursors.len().to_u64()]);
+            let commit = trace::span_start();
             if let Some(buffer) = &command_buffer {
                 let exec_buffer = buffer.clone_ref();
                 let handler = Arc::clone(&done);
@@ -433,6 +494,9 @@ impl<P: Platform> LocalTask<P> {
                 buffer.encode_signal(fifo_event.map(EventRef::Shared), value)?;
                 buffer.commit(OnFault::Return)?;
             }
+            // 50: the handler, the signal and the commit: the task
+            trace::span(50, commit, &[task]);
+            let complete = trace::span_start();
             let complete_sync = CompleteSync::<P> {
                 needs_complete: prepare_sync.needs_complete,
                 event: fifo_event,
@@ -440,18 +504,26 @@ impl<P: Platform> LocalTask<P> {
             };
             let exec_buffer = command_buffer.as_ref().map(Handle::clone_ref);
             let handler = Arc::clone(&done);
-            self.complete_resources(
+            let completed = self.complete_resources(
                 hold,
                 &resource_list,
                 complete_sync,
                 Box::new(move |info: CompletedInfo| {
                     sync_completed::<P>(exec_buffer.as_ref(), &handler, &info);
                 }),
-            )
+            );
+            // 51: the synchronize buffer: the task
+            trace::span(51, complete, &[task]);
+            completed
         })();
         if let Err(raised) = executed {
             // A raise after `complete_resources` committed its buffer reports 2 here, and that
             // buffer's handler reports again later.
+            if trace::on() {
+                // execfault: local task, refusal text. A ran/span-end event does not say
+                // whether decoding committed GPU work or returned a failure to the FIFO.
+                trace::event_text("execfault", &[task], &raised.exception().to_string());
+            }
             log::warn!(
                 "task {}: exec faulted: {}",
                 self.task_id,
@@ -460,6 +532,8 @@ impl<P: Platform> LocalTask<P> {
             done(ExecStatus::FAIL, None);
             hold.land(raised);
         }
+        // 52: the whole exec from its lock taken: the task
+        trace::span(52, whole, &[task]);
         Ok(())
     }
 

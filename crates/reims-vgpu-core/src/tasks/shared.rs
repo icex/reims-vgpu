@@ -253,31 +253,55 @@ impl<P: Platform> TaskCore<P> {
         }
     }
 
-    /// Deletes `resource` and clears its placement entry, under the unique lock.
+    /// Deletes `resource` and clears its placement entry, under the unique lock. A resource
+    /// whose last release reaches neither the host nor anything it sees is let go after the lock,
+    /// before the caller's completion, on the same thread ([`Resource::releases_internally`]); any
+    /// other under the lock, before the placement's clear, between the commands of other FIFOs.
     pub fn delete_resource(&self, hold: Hold<'_>, resource: u32) -> RaiseResult<()> {
-        let _lock = self.mutex.write();
-        self.live_manager()
-            .delete_object::<Resources>(hold, resource, true);
+        let waited = crate::trace::span_start();
+        let lock = self.mutex.write();
+        let locked = crate::trace::span_start();
+        let internal = self.live_manager().delete_resource(hold, resource);
+        let deleted = crate::trace::span_start();
+        drop(lock);
+        let released = u64::from(internal.is_some());
+        drop(internal);
+        // 60: the wait for the unique lock; 61: the delete under it, then the reference and
+        // whether the resource went after the lock; 64: its release there
+        crate::trace::span_to(60, waited, locked, &[]);
+        crate::trace::span_to(61, locked, deleted, &[u64::from(resource), released]);
+        if released != 0 {
+            crate::trace::span(64, deleted, &[u64::from(resource)]);
+        }
         Ok(())
     }
 
-    /// Deletes the object a serialized delete command names, under the unique lock. A
-    /// refused command is ignored.
+    /// Deletes the object a serialized delete command names, under the unique lock, a resource
+    /// let go as [`TaskCore::delete_resource`] lets it. A refused command is ignored.
     pub fn delete_object_with_serialized_data(
         &self,
         hold: Hold<'_>,
         data: &[u8],
     ) -> RaiseResult<()> {
-        let _lock = self.mutex.write();
-        match self.manager() {
-            Some(rm) => {
-                let _ = rm.delete_serialized_object(hold, data);
-            }
+        let waited = crate::trace::span_start();
+        let lock = self.mutex.write();
+        let locked = crate::trace::span_start();
+        let internal = match self.manager() {
+            Some(rm) => rm.delete_serialized(hold, data).1,
             // After teardown only a command that reaches the manager's state dies; the others
             // are refused first (their log goes nowhere without the manager's platform).
             None if serialized_delete_reaches_manager(data) => fatal!(DeathKind::TornDown),
-            None => {}
-        }
+            None => None,
+        };
+        let deleted = crate::trace::span_start();
+        drop(lock);
+        let released = u64::from(internal.is_some());
+        // As `delete_resource` lets a resource go
+        drop(internal);
+        // 60: the wait for the unique lock; 62: the delete under it, then whether a resource
+        // went after the lock
+        crate::trace::span_to(60, waited, locked, &[]);
+        crate::trace::span_to(62, locked, deleted, &[released]);
         Ok(())
     }
 
@@ -666,9 +690,10 @@ mod tests {
     use crate::platform::types::NsErrorText;
     use crate::raise::death::DeathKind as Fault;
     use crate::raise::death::DeathSite;
+    use crate::resources::buffer::child::HeapBufferResource;
     use crate::resources::manager::fixture::{Fx, P, PL, Placement, REC};
     use crate::resources::resource::with_platform;
-    use crate::resources::texture::views::SerializerTextureResource;
+    use crate::resources::texture::views::{RefTextureResource, SerializerTextureResource};
     use crate::tasks::{ResourceInvalidation, ResourceReference};
     use crate::testkit::capture::catch_death;
     use crate::testkit::{CompleteOn, Step, kind};
@@ -1120,6 +1145,87 @@ mod tests {
             t.base.delete_resource(Hold::NONE, 1).unwrap();
             assert!(t.base.get_existing_host_resource(1).is_none());
             assert_eq!(t.fx.placement(1), (0, 0));
+        }
+
+        /// What the release of a fake buffer saw: the task's unique lock free, and the
+        /// placement slot of reference 1.
+        type Released = Arc<parking_lot::Mutex<Vec<(bool, (u64, u64))>>>;
+
+        /// A buffer whose release records what it saw ([`Released`]).
+        fn watched_buffer(fx: &Fx, base: &Arc<TaskCore<P>>, seen: &Released) -> Fk<kind::Buffer> {
+            let (base, seen) = (Arc::downgrade(base), Arc::clone(seen));
+            let region = Arc::clone(&fx.region);
+            let deallocator: crate::platform::device::NoCopyDeallocator = Box::new(move || {
+                let free = base
+                    .upgrade()
+                    .is_some_and(|b| b.mutex.try_write().is_some());
+                let at = PL + 16;
+                let slot = (
+                    region.read_u64(at).unwrap(),
+                    region.read_u64(at + 8).unwrap(),
+                );
+                seen.lock().push((free, slot));
+            });
+            fx.platform
+                .world()
+                .new_obj::<kind::Buffer>(crate::testkit::objects::Model::Buffer(
+                    crate::testkit::objects::BufferModel {
+                        deallocator: Some(deallocator),
+                        ..Default::default()
+                    },
+                ))
+        }
+
+        /// A resource whose release reaches only the platform (a heap's buffer here) goes after
+        /// the unique lock and the placement's clear, before the delete returns, and so before
+        /// its completion; one whose release may reach the host (a texture over a backing) goes
+        /// under the lock, before the clear, as it always did
+        #[test]
+        fn an_internal_release_goes_after_the_lock() {
+            let Tx { fx, base } = tx_with(&entries3(), Placement::Mapped, true);
+            let base = Arc::new(base);
+            let seen = Released::default();
+            let buffer = watched_buffer(&fx, &base, &seen);
+            let heap_buffer = HeapBufferResource::new(view(&fx, false), buffer, false);
+            assert!(heap_buffer.releases_internally());
+            register(&fx, 1, &heap_buffer);
+            drop(heap_buffer);
+            fx.set_placement(1, 0x10, 5);
+            base.delete_resource(Hold::NONE, 1).unwrap();
+            assert_eq!(*seen.lock(), [(true, (0, 0))]);
+
+            seen.lock().clear();
+            let backing =
+                HeapBufferResource::new(view(&fx, false), watched_buffer(&fx, &base, &seen), false);
+            let host: Arc<dyn ResourceHost<P>> = fx.task_dyn.clone();
+            let texture = with_platform(&fx.platform, || {
+                RefTextureResource::new(Arc::downgrade(&host), 0, texture(&fx), backing)
+                    .unwrap()
+                    .unwrap()
+            });
+            assert!(!texture.releases_internally());
+            register(&fx, 1, &texture);
+            drop(texture);
+            fx.set_placement(1, 0x10, 5);
+            base.delete_resource(Hold::NONE, 1).unwrap();
+            assert_eq!(*seen.lock(), [(false, (0x10, 5))]);
+            assert_eq!(fx.placement(1), (0, 0));
+        }
+
+        /// The kinds whose release reaches only the platform's objects and the library's own
+        /// memory
+        #[test]
+        fn which_kinds_release_internally() {
+            let fx = Fx::new(&entries3(), Placement::Off);
+            assert!(
+                !view(&fx, false).releases_internally(),
+                "a view's base may lie on a surface"
+            );
+            let buffer = fx
+                .platform
+                .world()
+                .new_obj::<kind::Buffer>(Default::default());
+            assert!(HeapBufferResource::new(view(&fx, false), buffer, false).releases_internally());
         }
     }
 

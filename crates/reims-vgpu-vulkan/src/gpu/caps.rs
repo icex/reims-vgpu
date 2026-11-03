@@ -175,6 +175,18 @@ const PUBLIC_PRIMITIVE_TYPES: u64 = 5;
 pub mod stand_in {
     /// `supportsFamily:` of each of core's `FAMILIES`.
     pub const FAMILIES: [bool; 7] = [true, true, true, true, true, false, false];
+
+    /// Whether the device answers the Apple families and the tile memory an Apple GPU has
+    /// (`FAMILIES`, `TILE_SHADERS`, `IMAGE_BLOCKS`): yes unless `REIMS_VGPU_APPLE_FAMILIES` is
+    /// `0`, when it answers no family, no tile shaders and no imageblocks, as a Mac's discrete
+    /// GPU does. A macOS 26.4 guest's driver asks the device; told an Apple GPU, its compositor
+    /// draws with tile dispatches, framebuffer fetch and memoryless targets, which the runtime
+    /// runs through scratch images and the pixel interlock. Read once per process.
+    pub fn apple_families() -> bool {
+        static APPLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *APPLE
+            .get_or_init(|| std::env::var_os("REIMS_VGPU_APPLE_FAMILIES").is_none_or(|v| v != "0"))
+    }
     /// `supportsExtendedXR10Formats`.
     pub const EXTENDED_XR10_FORMATS: bool = true;
     /// The four texture alignment properties.
@@ -333,10 +345,10 @@ fn computed(device: &rt::Device) -> (u64, Limits, Flags) {
         supports_extended_xr10_formats: stand_in::EXTENDED_XR10_FORMATS,
         supports_float16_bcubic_filtering: stand_in::FLOAT16_BCUBIC_FILTERING,
         supports_heap_with_address_ranges: imports_host_memory,
-        supports_image_blocks: stand_in::IMAGE_BLOCKS,
+        supports_image_blocks: stand_in::IMAGE_BLOCKS && stand_in::apple_families(),
         supports_memory_order_atomics: stand_in::MEMORY_ORDER_ATOMICS,
         supports_native_hardware_fp16: props.description.has(VkFeature::ShaderFloat16),
-        supports_non_square_tile_shaders: stand_in::TILE_SHADERS,
+        supports_non_square_tile_shaders: stand_in::TILE_SHADERS && stand_in::apple_families(),
         supports_programmable_sample_positions: query(
             "areProgrammableSamplePositionsSupported",
             props.are_programmable_sample_positions_supported(),
@@ -347,7 +359,7 @@ fn computed(device: &rt::Device) -> (u64, Limits, Flags) {
         supports_simd_reduction: simd_reduction,
         supports_simd_shuffle_and_fill: simd_shuffle_and_fill,
         supports_texture_2d_multisample_array: stand_in::TEXTURE_2D_MULTISAMPLE_ARRAY,
-        supports_tile_shaders: stand_in::TILE_SHADERS,
+        supports_tile_shaders: stand_in::TILE_SHADERS && stand_in::apple_families(),
     };
     let amplification = amplification.min(stand_in::MAX_VERTEX_AMPLIFICATION_COUNT);
     (amplification, limits, flags)
@@ -434,7 +446,12 @@ pub fn read(device: &rt::Device, registry_id: u64, page_size: u64) -> Arc<Device
                     .unwrap_or(false),
             })
         }),
-        families: stand_in::FAMILIES.map(Ok),
+        families: if stand_in::apple_families() {
+            stand_in::FAMILIES
+        } else {
+            [false; 7]
+        }
+        .map(Ok),
         write_rounding_modes: stand_in::WRITE_ROUNDING_MODES.map(Ok),
         heap_buffer_page_private: heap_buffer_size_and_align(device, page_size, HEAP_QUERY_OPTIONS),
         min_linear_alignment_bgra8: send(

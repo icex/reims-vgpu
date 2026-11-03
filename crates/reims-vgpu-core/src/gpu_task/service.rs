@@ -20,6 +20,7 @@ use crate::fifo::wire::Records;
 use crate::guest::GuestPtr;
 use crate::guest::records::{FeaturesRef, SharedFeatures};
 use crate::memory::cursor::{Cursor, WritableCursor};
+use crate::memory::kept::KeptMappings;
 use crate::memory::map::MemoryMap;
 use crate::memory::mapping::Mapping;
 use crate::memory::page_table::PageTableWalker;
@@ -93,6 +94,9 @@ pub struct GpuTask<P: Platform> {
     /// The object lists, built by the handshake whether or not it found a device. The core's
     /// parts hold the same lists; with no core they are the only reference.
     pub(super) object_lists: Mutex<Option<Arc<ObjectLists<P>>>>,
+    /// The mappings its transfer buffers were made over, kept for the next buffer over the same
+    /// pages, until its end.
+    pub(super) kept: Arc<KeptMappings<P>>,
 }
 
 /// The task lock as a job holds it.
@@ -157,6 +161,7 @@ impl<P: Platform> GpuTask<P> {
             length: AtomicU64::new(0),
             handshake_lock: Mutex::new(()),
             object_lists: Mutex::new(None),
+            kept: KeptMappings::new(),
         })
     }
 
@@ -655,6 +660,7 @@ impl<P: Platform> ServiceSide<P> for GpuTask<P> {
         if let Some(core) = self.core.get() {
             core.teardown();
         }
+        self.kept.clear();
         drop(self.root_mapping.lock().take());
         *self.task_root.lock() = None;
         drop(self.page_table.lock().take());

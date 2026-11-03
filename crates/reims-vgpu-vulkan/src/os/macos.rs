@@ -326,6 +326,32 @@ pub(crate) fn plane_shape(surface: &MetalSurface, plane: u64) -> Option<(u64, u6
 /// reference of the surface, which the guest counts, keeps it.
 pub(crate) fn surface_memory_hold(_surface: &MetalSurface) -> impl Send + 'static {}
 
+/// Whether the device `device` makes `surface` a base anchor, a buffer of the platform's own over
+/// its base address that keeps the runtime's import between the guest's buffers, as on Linux
+/// (`os/linux/surface.rs`): never here. IOSurface's last release may unmap the memory while a
+/// buffer over it lives (`crate::remap`'s docs, "What is not ours to unmap"), and nothing holds it
+/// past that ([`surface_memory_hold`]), so an anchor could outlive the pages it lies over.
+pub(crate) fn wants_base_anchor(_surface: &MetalSurface, _device: u64) -> bool {
+    false
+}
+
+/// Keeps no base anchor: [`wants_base_anchor`] asks for none here, and one given is dropped.
+pub(crate) fn keep_base_anchor(_surface: &MetalSurface, _device: u64, anchor: Option<rt::Buffer>) {
+    drop(anchor);
+}
+
+/// The base anchors live in the process: none here ([`wants_base_anchor`]).
+pub(crate) fn anchors_live() -> usize {
+    0
+}
+
+/// The declaration of the writes of `surface`'s memory to the runtime (`rt::DeclaredMemory`):
+/// none here. IOSurface's memory takes writes the library never sees: another process's, and
+/// those through its base address that IOSurface hands out.
+pub(crate) fn surface_declared(_surface: &MetalSurface) -> Option<rt::DeclaredMemory> {
+    None
+}
+
 /// The surface's key that names its YCbCr matrix (`kIOSurfaceYCbCrMatrix`).
 pub(crate) const MATRIX_KEY: &str = "IOSurfaceYCbCrMatrix";
 

@@ -477,10 +477,10 @@ pub fn relayed(kind: rt::Degradation) -> bool {
 static COUNTS: [AtomicU64; NATIVE_RELAYED.len()] =
     [const { AtomicU64::new(0) }; NATIVE_RELAYED.len()];
 
-/// Counts an occurrence of `kind`, one of [`NATIVE_RELAYED`]: whether it is the process's first,
-/// which is relayed.
-pub fn count(kind: rt::Degradation) -> bool {
-    count_in(&COUNTS, kind)
+/// Counts an occurrence of the kind at `at` in [`NATIVE_RELAYED`]: whether it is the process's
+/// first, which is relayed.
+pub fn count_at(at: usize) -> bool {
+    count_in(&COUNTS, at)
 }
 
 /// Each kind of [`NATIVE_RELAYED`] this process met, with how many times.
@@ -488,11 +488,8 @@ pub fn counts() -> Vec<(rt::Degradation, u64)> {
     counts_in(&COUNTS)
 }
 
-/// [`count`] in `counts`, one per kind of [`NATIVE_RELAYED`].
-fn count_in(counts: &[AtomicU64], kind: rt::Degradation) -> bool {
-    let Some(at) = NATIVE_RELAYED.iter().position(|r| r.kind == kind) else {
-        return false;
-    };
+/// [`count_at`] in `counts`, one per kind of [`NATIVE_RELAYED`].
+fn count_in(counts: &[AtomicU64], at: usize) -> bool {
     counts
         .get(at)
         .is_some_and(|c| c.fetch_add(1, Ordering::Relaxed) == 0)
@@ -561,12 +558,13 @@ mod tests {
     fn a_native_relay_is_counted() {
         let counts = [const { AtomicU64::new(0) }; NATIVE_RELAYED.len()];
         let kind = rt::Degradation::DeviceInterpolation;
+        let at = NATIVE_RELAYED.iter().position(|r| r.kind == kind).unwrap();
         assert!(counts_in(&counts).is_empty());
-        assert!(count_in(&counts, kind));
-        assert!(!count_in(&counts, kind));
-        assert!(!count_in(&counts, kind));
+        assert!(count_in(&counts, at));
+        assert!(!count_in(&counts, at));
+        assert!(!count_in(&counts, at));
         assert_eq!(counts_in(&counts), [(kind, 3)]);
-        assert!(!count_in(&counts, rt::Degradation::ReleasedCommandState));
+        assert!(!count_in(&counts, NATIVE_RELAYED.len()));
         assert!(relayed(kind) && !relayed(rt::Degradation::ReleasedCommandState));
     }
 }

@@ -47,7 +47,7 @@ use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
     Nil, Policy, RUNTIME_DOMAIN, create, decide, get, get_describing, hearing, metal_aborts, plain,
-    plain_at, send, unrepresentable,
+    plain_at, send, unrepresentable, unstopped_at,
 };
 use crate::gpu::backing::{self, Backing, HEAP_GRANULE};
 use crate::gpu::caps;
@@ -350,6 +350,22 @@ fn with_token(
     }
 }
 
+/// `descriptor`, a no-copy buffer's over a surface's memory, with `declared`, the declaration of
+/// that memory's writes (`crate::os::surface_declared`), where there is one, and then its pages
+/// fixed for the buffer's life where `fixed`: the runtime refuses its detach and rebind, and
+/// lists it among no live buffers, which a command reaches through an address.
+fn declare<'a>(
+    descriptor: rt::BufferDescriptor<'a>,
+    declared: Option<&'a rt::DeclaredMemory>,
+    fixed: bool,
+) -> rt::BufferDescriptor<'a> {
+    match declared {
+        Some(declared) if fixed => descriptor.with_declared_memory(declared).with_pages_fixed(),
+        Some(declared) => descriptor.with_declared_memory(declared),
+        None => descriptor,
+    }
+}
+
 /// The slot of a buffer `sel` makes on `raw` that Metal suballocates, where `placing` holds one
 /// ([`Placing::pool_slot`]): the runtime's reservation of its pool and the slot's offset in it,
 /// which the buffer's descriptor takes (`BufferDescriptor::with_pool_slot`). A refusal of the
@@ -542,6 +558,9 @@ impl VulkanDevice {
     /// whatever the surface's last release (`crate::os::surface_memory_hold`), and nothing holds
     /// it on macOS, where the surface's last release may unmap it before (`crate::remap`'s docs,
     /// "What is not ours to unmap"); over an alias, the keep-alive holds the alias until then.
+    /// On Linux, the surface's second buffer over its base address on the device makes, once the
+    /// buffer is made, the surface's base anchor, which keeps the runtime's import of that memory
+    /// live between buffers over it ([`buffer_over_surface_at`](Self::buffer_over_surface_at)).
     ///
     /// At an offset into the surface's allocation (`kIOSurfaceOffset`,
     /// [`crate::os::surface_offset`]) the base address lies that far into it, and the buffer's last
@@ -560,7 +579,8 @@ impl VulkanDevice {
         token: rt::RangeToken,
     ) -> RaiseResult<Option<rt::Buffer>> {
         let any = rt::AddressPlacement::Any;
-        self.buffer_over_surface_at(sel, surface, (any, Some(token)), None, Nil::BufferLength)
+        let placed = (any, Some(token));
+        self.buffer_over_surface_at(sel, surface, placed, None, Nil::BufferLength, true)
     }
 
     /// [`buffer_over_surface`](Self::buffer_over_surface), at `placement` in the Metal address
@@ -573,6 +593,41 @@ impl VulkanDevice {
     /// GPU's writes through the surface never reach its memory ([`crate::os::gpu_read_only`]),
     /// the alias is read-only: the GPU reads the same pages, and its writes are dropped as
     /// through a read-only alias of the guest's pages ([`crate::gpu::backing`]'s docs).
+    ///
+    /// Over a surface whose memory's writes are declared ([`crate::os::surface_declared`]), the
+    /// buffer carries the declaration, at its base address or over the alias alike, and its
+    /// pages are fixed for its life where `fixed`: a texture's own buffer, which no guest
+    /// detaches, rebinds or reaches through an address, and which the runtime then lists among
+    /// no live buffers. `fixed` changes nothing over a surface of no declaration, so every
+    /// buffer over such a surface is made as before. Over fixed pages of declared memory, the
+    /// runtime shares one shadow image among the textures of the same image over the same bytes,
+    /// and the import keeps up to its `HELD_PER_IMPORT` of them while no texture uses them, until
+    /// the import goes (`crate::os::linux::surface`'s docs, "Declared writes"), which is an
+    /// exhaustion difference of its own (below).
+    ///
+    /// After the guest's buffer over the surface's base address is made, exactly as it is made
+    /// without one, the second such buffer on this device makes the surface's base anchor
+    /// (`crate::os::wants_base_anchor`, [`base_anchor`](Self::base_anchor)), which lies in that
+    /// buffer's import and keeps it, until the surface's last object goes. A guest that makes a
+    /// buffer or texture over the surface at each frame, each released before the next is made,
+    /// then joins that import, and the images the runtime shares over it, where it would import
+    /// the pages again at each. The anchor is no buffer of the guest's: it takes no Metal address
+    /// and no range, and no buffer shares its range ([`SURFACE_BUFFERS`]), so every Metal address
+    /// is as it would be without it. Never on macOS, nor at an offset or for a surface whose GPU
+    /// writes never reach its memory, whose buffers lie over an alias.
+    ///
+    /// The differences it makes that can reach the guest are at exhaustion: while no buffer of
+    /// the guest's lies over the surface, its import (one `VkDeviceMemory` over the pinned pages)
+    /// and up to the runtime's `HELD_PER_IMPORT` shared images, each with its own dma-buf image
+    /// import on a device that refuses the pages' pointer, stay held where none were; and over a
+    /// surface whose writes are declared, up to `HELD_PER_IMPORT` shared shadow images, each of
+    /// the runtime's own device memory as large as the texture whose shadow it was, stay held
+    /// where each went with its texture. A later buffer or texture of the guest's, over any
+    /// memory, can so be refused for lack of device memory one call sooner, which under
+    /// [`Policy::Dies`] is a nil or a death at an earlier op; and a buffer over the surface that
+    /// joins the anchor's import is not refused where a new import of its pages would have been.
+    /// Bounded by one import, its shared images and its shadow images, per anchored surface and
+    /// device, which a live buffer of the guest's holds through most of a frame anyway.
     pub(crate) fn buffer_over_surface_at(
         &self,
         sel: &'static str,
@@ -580,8 +635,11 @@ impl VulkanDevice {
         (placement, token): (rt::AddressPlacement, Option<rt::RangeToken>),
         shares: Option<&rt::Buffer>,
         nil: Nil,
+        fixed: bool,
     ) -> RaiseResult<Option<rt::Buffer>> {
         use reims_vgpu_core::platform::os::surface::Surface as _;
+        let whole = timing::span_start();
+        let declared = crate::os::surface_declared(surface);
         let held = Arc::clone(surface);
         let run: rt::Deallocator = Box::new(move |_, _| {
             let _env = BlockEnv::foreign();
@@ -590,7 +648,7 @@ impl VulkanDevice {
         let (base, length) = (pointer(sel, surface.base_address()), surface.alloc_size());
         let offset = crate::os::surface_offset(surface);
         let read_only = crate::os::gpu_read_only(surface);
-        let (base, keep) = if offset == 0 && !read_only {
+        let (base, keep, at_base) = if offset == 0 && !read_only {
             log::debug!(
                 "{sel}: a buffer of {length:#x} bytes over a surface in {}, imported at its base \
                  address",
@@ -598,10 +656,14 @@ impl VulkanDevice {
             );
             // The runtime runs the deallocator as it lets go of the buffer, which may drop the
             // surface's last reference, and frees its import once nothing else holds it.
+            let holding = timing::span_start();
             let hold = crate::os::surface_memory_hold(surface);
             let site = backing::ImportSite::SurfaceBase;
             let traced = backing::ImportTrace::new(site, base, length, base);
-            (base, backing::keep_alive((hold, traced)))
+            let keep = backing::keep_alive((hold, traced));
+            // sp 1: the buffer's length
+            timing::span(1, holding, &[length]);
+            (base, keep, true)
         } else {
             let first = u64::try_from(base.as_ptr().addr())
                 .unwrap_or(u64::MAX)
@@ -615,7 +677,21 @@ impl VulkanDevice {
                 fresh = true;
                 backing::gather(sel, &allocation, length.saturating_add(offset), read_only)
             };
+            let aliasing = timing::span_start();
             let alias = crate::os::surface_alias(surface, made);
+            // sp 2: whether it gathered a new alias, whether there is one, the buffer's length,
+            // its offset into the allocation, whether the alias is read-only
+            timing::span(
+                2,
+                aliasing,
+                &[
+                    u64::from(fresh),
+                    u64::from(alias.is_some()),
+                    length,
+                    offset,
+                    u64::from(read_only),
+                ],
+            );
             log::debug!(
                 "{sel}: a buffer of {length:#x} bytes over a surface in {}, at offset \
                  {offset:#x}{}, over {} alias of its allocation",
@@ -639,7 +715,7 @@ impl VulkanDevice {
             let from = at
                 .as_ptr()
                 .wrapping_add(usize::try_from(offset).unwrap_or(usize::MAX));
-            (pointer(sel, HostPtr::from_ptr(from)), keep)
+            (pointer(sel, HostPtr::from_ptr(from)), keep, false)
         };
         // SAFETY: an alias of the surface's allocation stays mapped until the runtime freed its
         // import, which the keep-alive holds, and so does the surface's own memory on Linux
@@ -658,10 +734,83 @@ impl VulkanDevice {
             Some(other) => descriptor.with_range_of(other),
             None => descriptor,
         };
-        create(sel, Policy::Dies, nil, || {
+        let descriptor = declare(descriptor, declared.as_ref(), fixed);
+        let making = timing::span_start();
+        let made = create(sel, Policy::Dies, nil, || {
             self.raw
                 .new_buffer_with_descriptor(with_token(descriptor, token))
-        })
+        })?;
+        // sp 3: the buffer's length, whether it is at the surface's base address, whether it was
+        // made
+        let at = u64::from(at_base);
+        timing::span(3, making, &[length, at, u64::from(made.is_some())]);
+        // The guest's buffer is made as it would be without an anchor; the anchor joins its import.
+        let anchoring = timing::span_start();
+        let wanted =
+            at_base && made.is_some() && crate::os::wants_base_anchor(surface, self.id().0);
+        let mut anchored = false;
+        if wanted {
+            let anchor = self.base_anchor(sel, surface, base, length, declared.as_ref());
+            anchored = anchor.is_some();
+            crate::os::keep_base_anchor(surface, self.id().0, anchor);
+        }
+        // sp 4: whether the anchor was asked for, whether it was made
+        timing::span(4, anchoring, &[u64::from(wanted), u64::from(anchored)]);
+        // sp 5: the buffer's length, whether it is at the surface's base address, whether it was
+        // made
+        timing::span(5, whole, &[length, at, u64::from(made.is_some())]);
+        Ok(made)
+    }
+
+    /// `surface`'s base anchor on this device (`crate::os::wants_base_anchor`): a buffer of the
+    /// platform's own over the `length` bytes at its base address `base`, outside the Metal
+    /// address space ([`crate::gpu::own_buffer`]), of the guest's buffers' options, with no
+    /// deallocator and no range token, whose keep-alive holds only the surface's memory hold,
+    /// carrying the declaration of the memory's writes `declared` where there is one, its pages
+    /// fixed then (the runtime withdraws a declaration a buffer over the same bytes lacks). Made
+    /// right after a buffer over the same bytes, it lies in that buffer's import (the runtime's
+    /// join of a buffer over the bytes a live one was made over), so it makes no import and
+    /// keeps that one live, and the images the runtime shares over it, until the surface's last
+    /// object goes. Its memory has no dma-buf source, so it never makes one of its own pages
+    /// where the device refuses their pointer: there it can only join. `None` where the runtime
+    /// refuses it, which is logged and changes nothing the guest sees: the guest's buffer is made
+    /// already, and the anchor is never asked again. Nothing here dies but at a degradation the
+    /// runtime announces that ends the process, at `sel`, as one in the guest's call would.
+    fn base_anchor(
+        &self,
+        sel: &'static str,
+        surface: &OsSurface,
+        base: NonNull<u8>,
+        length: u64,
+        declared: Option<&rt::DeclaredMemory>,
+    ) -> Option<rt::Buffer> {
+        let hold = crate::os::surface_memory_hold(surface);
+        let site = backing::ImportSite::SurfaceAnchor;
+        let traced = backing::ImportTrace::new(site, base, length, base);
+        // SAFETY: the memory hold keeps the surface's own memory, or its view of the guest's
+        // pages, mapped until the runtime drops the keep-alive, after it freed the import.
+        let memory = unsafe { rt::HostMemory::new(base) };
+        let contents = rt::BufferContents::NoCopy {
+            memory,
+            deallocator: None,
+            keep_alive: Some(backing::keep_alive((hold, traced))),
+        };
+        let options = rt::ResourceOptions::default();
+        let descriptor = declare(
+            crate::gpu::own_descriptor(length, options, contents),
+            declared,
+            true,
+        );
+        match unstopped_at(sel, || self.raw.new_buffer_with_descriptor(descriptor)) {
+            Ok(anchor) => Some(anchor),
+            Err(e) => {
+                log::debug!(
+                    "{sel}: no base anchor of {length:#x} bytes over a surface in {}: {e}",
+                    crate::os::memory_kind(surface)
+                );
+                None
+            }
+        }
     }
 
     /// A live buffer of this device over the surface `key` at its range's address
@@ -849,6 +998,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         use reims_vgpu_core::platform::os::surface::Surface as _;
         let sel = "newBufferWithIOSurface:";
         let surface = iosurface.unwrap_or_else(|| unrepresentable(sel, "a nil IOSurface"));
+        let whole = timing::span_start();
         let surface = Arc::new(surface.clone_ref());
         let (key, alloc_size) = (surface.id().0, surface.alloc_size());
         let (place, space) = metal_space::surface_buffer(key, alloc_size);
@@ -878,15 +1028,25 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         };
         let token: rt::RangeToken = Box::new(space);
         let shares = live.as_ref().map(|live| &live.raw);
-        let made =
-            self.buffer_over_surface_at(sel, &surface, (placement, Some(token)), shares, nil)?;
-        Ok(made.map(|raw| {
+        let shared = u64::from(shares.is_some());
+        let placed = (placement, Some(token));
+        let made = self.buffer_over_surface_at(sel, &surface, placed, shares, nil, false)?;
+        let wrapping = timing::span_start();
+        let kept = u64::from(matches!(placement, rt::AddressPlacement::At(_)));
+        let made = made.map(|raw| {
             let buffer = self.buffer(raw, Some(surface), false);
             if let rt::AddressPlacement::At(_) = placement {
                 VulkanDevice::keep_surface_buffer(key, &buffer);
             }
             buffer
-        }))
+        });
+        // sp 7: whether the buffer was made, whether it is at its own address (kept among the
+        // surface's buffers, `keep_surface_buffer`)
+        timing::span(7, wrapping, &[u64::from(made.is_some()), kept]);
+        // sp 6: the surface's allocation size, whether the buffer shares a live one's range,
+        // whether it was made
+        timing::span(6, whole, &[alloc_size, shared, u64::from(made.is_some())]);
+        Ok(made)
     }
 
     /// Nil for a length of 0 or past the device's largest buffer, and for memory the device
@@ -1346,6 +1506,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             Some(format) => fields.on_surface_ycbcr(sel, format),
             None => fields.descriptor(sel, Maker::Surface),
         };
+        let whole = timing::span_start();
         let usage = match crate::os::gpu_read_only(surface) {
             true => crate::gpu::resource::read_only_usage(&mut desc),
             false => 0,
@@ -1380,15 +1541,27 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             reims_vgpu_core::platform::os::surface::Surface::alloc_size(&*surface),
         ));
         let token: rt::RangeToken = Box::new(Arc::clone(&space));
-        let Some(buffer) = self.buffer_over_surface(sel, &surface, token)? else {
+        let buffering = timing::span_start();
+        let buffer = self.buffer_over_surface(sel, &surface, token)?;
+        // sp 10: whether the buffer was made
+        timing::span(10, buffering, &[u64::from(buffer.is_some())]);
+        let Some(buffer) = buffer else {
             return Ok(None);
         };
         let format = fields.raw_pixel_format();
-        let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
+        let texturing = timing::span_start();
+        let raw = create(sel, Policy::Dies, Nil::Never, || {
             (buffer.new_texture_with_iosurface_plane(&desc, plane))
                 .map_err(|e| format_refused(sel, "a texture of", format, e))
-        })?
-        else {
+        })?;
+        // sp 11: the Metal pixel format, the texture's width and height, the surface's allocation
+        // size (the buffer's length), whether the texture was made. Read from the surface, not the
+        // runtime's buffer, so the span adds no call of the runtime's and no point a task stops at.
+        let (width, height) = (desc.width, desc.height);
+        let made = u64::from(raw.is_some());
+        let length = reims_vgpu_core::platform::os::surface::Surface::alloc_size(&*surface);
+        timing::span(11, texturing, &[format, width, height, length, made]);
+        let Some(raw) = raw else {
             return Ok(None);
         };
         let over_guest_pages = crate::os::over_guest_pages(&surface);
@@ -1404,9 +1577,20 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         // A texture on a surface over the guest's pages meets a texture a heap over them keeps
         // apart through them.
         if over_guest_pages {
+            use reims_vgpu_core::num::ToU64 as _;
+            let measuring = timing::span_start();
             let memory = crate::gpu::writes::texture_memory(&texture).ranges;
+            // sp 12: the ranges of the texture's memory, their bytes
+            let bytes = memory.iter().map(|r| r.end.saturating_sub(r.start)).sum();
+            timing::span(12, measuring, &[memory.len().to_u64(), bytes]);
+            let watching = timing::span_start();
+            let ranges = memory.len().to_u64();
             crate::gpu::over_pages::over_surface(sel, memory, texture.life());
+            // sp 13: the ranges of the texture's memory
+            timing::span(13, watching, &[ranges]);
         }
+        // sp 14: whether the surface is over the guest's pages
+        timing::span(14, whole, &[u64::from(over_guest_pages)]);
         Ok(Some(texture))
     }
 
@@ -2022,6 +2206,14 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_surface_textures_image_keeps_the_surfaces_memory() {
+        surface_textures_image_keeps_the_surfaces_memory(0);
+    }
+
+    /// [`a_surface_textures_image_keeps_the_surfaces_memory`], each surface first given `churned`
+    /// buffers over it, each released before the next, which anchor a surface of its own memory
+    /// from the second (`base_anchor`'s tests).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn surface_textures_image_keeps_the_surfaces_memory(churned: u32) {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::time::Duration;
 
@@ -2103,6 +2295,13 @@ pub(crate) mod tests {
         ];
         for (surface, cores) in surfaces {
             let base = surface.base_address();
+            for _ in 0..churned {
+                drop(d.new_buffer_on_surface(Some(&surface)).unwrap().unwrap());
+            }
+            if churned >= 2 {
+                let anchored = crate::os::has_base_anchor(&surface, d.id().0);
+                assert_eq!(anchored, !cores, "anchored (core's mapping: {cores})");
+            }
             let texture = d
                 .new_texture_on_surface(&bgra(64, 32, 0), Some(&surface), 0)
                 .unwrap()
@@ -2653,4 +2852,7 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "macos")]
     pub(crate) mod metal_tests;
+
+    #[cfg(target_os = "linux")]
+    mod base_anchor;
 }

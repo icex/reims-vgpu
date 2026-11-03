@@ -509,6 +509,9 @@ impl CommandBufferObject {
         if hold.is_some() {
             return;
         }
+        // This buffer deliberately waits for a timeout: keep its failure and completion
+        // separate from other ready buffers on the same Vulkan queue.
+        get(sel, || self.raw.set_grouped_submission(false));
         let event = get(sel, || self.device.raw.new_shared_event());
         let at = || rt::EventRef::Shared(&event);
         get(sel, || self.raw.encode_signal_event(at(), 1));
@@ -923,6 +926,10 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
     /// where none can complete first ([`waiting`]).
     fn command_buffer(&self, _on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
         let raw = waiting("commandBuffer", || self.raw.command_buffer())?;
+        // Ready buffers on the same Vulkan queue share one driver submission. The runtime
+        // ends a group at a dependency, another queue, or sixteen batches, without waiting
+        // for another commit to arrive.
+        get("commandBuffer", || raw.set_grouped_submission(true));
         let predication = Predication::new(&self.device);
         let tiler = Arc::default();
         get("commandBuffer", || {
@@ -1632,6 +1639,69 @@ mod tests {
         assert_eq!(a.device().unwrap().id(), q.device.id());
         q.set_label("reims-vgpu.exec");
         assert_eq!(q.raw.label().as_deref(), Some("reims-vgpu.exec"));
+    }
+
+    /// Platform-created buffers ready together share submissions while retaining their writes
+    /// and completion order. More than one group exercises the runtime's sixteen-batch bound.
+    #[test]
+    fn ready_platform_buffers_group_and_complete_in_order() {
+        const COUNT: usize = 40;
+        let d = dev();
+        let q = d.new_command_queue().unwrap();
+        let gate = d.new_shared_event().unwrap();
+        let target = d
+            .raw
+            .new_buffer((COUNT * 16) as u64, rt::ResourceOptions::shared())
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let buffers: Vec<_> = (0..COUNT)
+            .map(|index| {
+                let cb = buffer(&q);
+                if index == 0 {
+                    cb.encode_wait(Some(EventRef::Shared(&gate)), 1).unwrap();
+                }
+                let mut blit = cb.raw.blit_command_encoder().unwrap();
+                let start = (index * 16) as u64;
+                blit.fill_buffer(&target, start..start + 16, index as u8 + 1)
+                    .unwrap();
+                blit.end_encoding().unwrap();
+                let tx = tx.clone();
+                cb.add_completed_handler(
+                    OnFault::Return,
+                    Box::new(move |info| tx.send((index, info)).unwrap()),
+                )
+                .unwrap();
+                cb.commit(OnFault::Return).unwrap();
+                cb
+            })
+            .collect();
+        let before = d.raw.work_counts();
+        gate.set_signaled_value(1).unwrap();
+        for cb in &buffers {
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            assert_eq!(cb.status(), CommandBufferStatus::COMPLETED);
+            assert_eq!(cb.error(), None);
+        }
+        for index in 0..COUNT {
+            let (completed, info) = rx.recv().unwrap();
+            assert_eq!(completed, index);
+            assert_eq!(info.status, CommandBufferStatus::COMPLETED);
+            assert_eq!(info.error, None);
+        }
+        let after = d.raw.work_counts();
+        let grouped = after.batches_grouped - before.batches_grouped;
+        let submissions = after.queue_submissions - before.queue_submissions;
+        eprintln!(
+            "PLATFORM-GROUPED: {COUNT} buffers, {grouped} grouped, {submissions} submissions"
+        );
+        assert!(grouped >= 2);
+        assert!(submissions < COUNT as u64);
+        let contents = target.contents().unwrap();
+        // SAFETY: the shared buffer has COUNT * 16 bytes, and all its writers completed.
+        let bytes = unsafe { std::slice::from_raw_parts(contents.as_ptr(), COUNT * 16) };
+        for (index, bytes) in bytes.chunks_exact(16).enumerate() {
+            assert!(bytes.iter().all(|&byte| byte == index as u8 + 1));
+        }
     }
 
     /// An empty buffer commits and completes: its completed handler sees Completed and no

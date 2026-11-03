@@ -1,0 +1,221 @@
+diff --git a/meson.build b/meson.build
+index 56fb91e..d69cb4a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -248,6 +248,21 @@ guestfwdtest = executable('guestfwdtest', 'test/guestfwdtest.c',
+ 
+ test('guestfwd', guestfwdtest)
+ 
++if host_machine.system() == 'linux'
++  unixpolltest = executable('unixpolltest', 'test/unix-polltest.c',
++    link_with: [lib],
++    c_args: cargs,
++    link_args: vflag,
++    include_directories: ['src'],
++    dependencies: libslirp_deps,
++  )
++
++  test('unix-poll-open', unixpolltest,
++    args: [meson.current_build_dir() / 'poll-open.sock', 'open-peer'])
++  test('unix-poll-closed', unixpolltest,
++    args: [meson.current_build_dir() / 'poll-closed.sock', 'close-before-data'])
++endif
++
+ if install_devel
+   install_headers(['src/libslirp.h'], subdir : 'slirp')
+ 
+diff --git a/src/slirp.c b/src/slirp.c
+index 0fc51a9..ef641e0 100644
+--- a/src/slirp.c
++++ b/src/slirp.c
+@@ -1091,8 +1091,9 @@ void slirp_pollfds_poll(Slirp *slirp, int select_error,
+              */
+             else
+ #endif
+-                if (revents &
+-                     (SLIRP_POLL_IN | SLIRP_POLL_HUP | SLIRP_POLL_ERR | SLIRP_POLL_PRI)) {
++                if (!(so->so_state & SS_FCANTRCVMORE) &&
++                    (revents &
++                     (SLIRP_POLL_IN | SLIRP_POLL_HUP | SLIRP_POLL_ERR | SLIRP_POLL_PRI))) {
+                 /*
+                  * Check for incoming connections
+                  */
+diff --git a/test/unix-polltest.c b/test/unix-polltest.c
+new file mode 100644
+index 0000000..ac0cb43
+--- /dev/null
++++ b/test/unix-polltest.c
+@@ -0,0 +1,173 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++/* Authored Ethernet/TCP client for the installed libslirp, no QEMU/KVM/GPU. */
++#define _GNU_SOURCE
++#include <slirp/libslirp.h>
++#include <glib.h>
++#include <assert.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++
++static Slirp *stack;
++static unsigned char frames[256][2048];
++static size_t sizes[256], head, tail;
++static const unsigned char guest_mac[6] = {0x52,0x54,0,0x12,0x34,0x56};
++static unsigned char host_mac[6] = {0x52,0x55,10,0,2,2};
++static uint32_t seq = 1000, ack;
++static int synacks, fins, rsts;
++static struct pollfd pfds[128];
++static int npfds, registered, unregistered;
++static void register_socket(slirp_os_socket fd,void *p){(void)fd;(void)p;registered++;}
++static void unregister_socket(slirp_os_socket fd,void *p){(void)fd;(void)p;unregistered++;}
++
++static uint64_t ns(clockid_t id)
++{
++    struct timespec t;
++    assert(clock_gettime(id, &t) == 0);
++    return (uint64_t)t.tv_sec*1000000000 + t.tv_nsec;
++}
++static int64_t clock_ns(void *p) { (void)p; return ns(CLOCK_MONOTONIC); }
++static void error(const char *msg, void *p) { (void)p; fprintf(stderr,"guest_error %s\n",msg); abort(); }
++static void *timer_new(SlirpTimerCb cb, void *a, void *p)
++{ (void)cb; (void)a; (void)p; abort(); }
++static void timer_free(void *a, void *p) { (void)a; (void)p; abort(); }
++static void timer_mod(void *a, int64_t t, void *p) { (void)a; (void)t; (void)p; abort(); }
++static void notice(void *p) { (void)p; }
++static slirp_ssize_t output(const void *buf, size_t len, void *p)
++{
++    (void)p;
++    assert(tail-head < 256 && len <= 2048);
++    memcpy(frames[tail%256],buf,len);sizes[tail%256]=len;tail++;
++    return len;
++}
++static unsigned get16(const unsigned char *p) { return p[0]*256u+p[1]; }
++static uint32_t get32(const unsigned char *p)
++{ return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3]; }
++static void put16(unsigned char *p, unsigned v) { p[0]=v>>8;p[1]=v; }
++static void put32(unsigned char *p, uint32_t v)
++{ p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v; }
++static unsigned sum(const unsigned char *p, size_t n, unsigned s)
++{
++    while(n>=2){s+=get16(p);p+=2;n-=2;}
++    if(n)s+=p[0]<<8;
++    return s;
++}
++static unsigned checksum(unsigned s)
++{ while(s>>16)s=(s&65535)+(s>>16);return (~s)&65535; }
++static void tcp(unsigned flags, const void *data, size_t len)
++{
++    unsigned char packet[1600]={0};
++    assert(len<=1400);
++    memcpy(packet,host_mac,6);memcpy(packet+6,guest_mac,6);put16(packet+12,0x800);
++    unsigned char *ip=packet+14,*t=ip+20;
++    ip[0]=0x45;put16(ip+2,40+len);ip[8]=64;ip[9]=6;
++    ip[12]=10;ip[14]=2;ip[15]=15;ip[16]=10;ip[18]=2;ip[19]=2;
++    put16(ip+10,checksum(sum(ip,20,0)));
++    put16(t,40000);put16(t+2,8888);put32(t+4,seq);put32(t+8,ack);
++    t[12]=0x50;t[13]=flags;put16(t+14,65535);
++    if(len)memcpy(t+20,data,len);
++    put16(t+16,checksum(sum(t,20+len,sum(ip+12,8,6+20+len))));
++    slirp_input(stack,packet,54+len);
++    if(flags&2)seq++;
++    seq+=len;
++    if(flags&1)seq++;
++}
++static void drain(void)
++{
++    while(head<tail){
++        unsigned char packet[2048];size_t n=sizes[head%256];
++        memcpy(packet,frames[head%256],n);head++;
++        assert(n>=14);
++        if(get16(packet+12)==0x806){
++            unsigned char *a=packet+14;
++            assert(n>=42 && get16(a+6)==1);
++            unsigned char reply[42]={0};
++            memcpy(reply,packet+6,6);memcpy(reply+6,guest_mac,6);put16(reply+12,0x806);
++            unsigned char *r=reply+14;put16(r,1);put16(r+2,0x800);r[4]=6;r[5]=4;put16(r+6,2);
++            memcpy(r+8,guest_mac,6);memcpy(r+14,a+24,4);memcpy(r+18,a+8,6);memcpy(r+24,a+14,4);
++            slirp_input(stack,reply,sizeof(reply));
++        }else if(get16(packet+12)==0x800){
++            unsigned char *ip=packet+14;assert(ip[9]==6);
++            unsigned char *t=ip+(ip[0]&15)*4;assert(get16(t)==8888 && get16(t+2)==40000);
++            assert(checksum(sum(ip,(ip[0]&15)*4,0))==0);
++            assert(checksum(sum(t,get16(ip+2)-(ip[0]&15)*4,sum(ip+12,8,6+get16(ip+2)-(ip[0]&15)*4)))==0);
++            memcpy(host_mac,packet+6,6);
++            unsigned flags=t[13];
++            if(flags&4){rsts++;continue;}
++            if(flags&2){assert(flags&16);synacks++;ack=get32(t+4)+1;tcp(16,NULL,0);}
++            if(flags&1){fins++;ack=get32(t+4)+1;tcp(16,NULL,0);}
++        }else abort();
++    }
++}
++static int add_poll(slirp_os_socket fd,int events,void *p)
++{
++    (void)p;assert(npfds<128);int i=npfds++;
++    pfds[i]=(struct pollfd){.fd=fd};
++    if(events&SLIRP_POLL_IN)pfds[i].events|=POLLIN;
++    if(events&SLIRP_POLL_OUT)pfds[i].events|=POLLOUT;
++    if(events&SLIRP_POLL_PRI)pfds[i].events|=POLLPRI;
++    if(events&SLIRP_POLL_ERR)pfds[i].events|=POLLERR;
++    if(events&SLIRP_POLL_HUP)pfds[i].events|=POLLHUP;
++    return i;
++}
++static int revents(int i,void *p)
++{
++    (void)p;assert(i>=0&&i<npfds);int e=pfds[i].revents,r=0;
++    assert(!(e&POLLNVAL));
++    if(e&POLLIN)r|=SLIRP_POLL_IN;
++    if(e&POLLOUT)r|=SLIRP_POLL_OUT;
++    if(e&POLLPRI)r|=SLIRP_POLL_PRI;
++    if(e&POLLERR)r|=SLIRP_POLL_ERR;
++    if(e&POLLHUP)r|=SLIRP_POLL_HUP;
++    return r;
++}
++int main(int argc,char **argv)
++{
++    assert(argc==3);signal(SIGPIPE,SIG_IGN);
++    struct sockaddr_un address={.sun_family=AF_UNIX};
++    assert(strlen(argv[1])<sizeof(address.sun_path));strcpy(address.sun_path,argv[1]);
++    int listener=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0);assert(listener>=0);
++    assert(bind(listener,(void*)&address,sizeof(address))==0);assert(listen(listener,2)==0);
++    SlirpConfig cfg={.version=6,.restricted=1,.in_enabled=true,.disable_dns=true,.disable_dhcp=true};
++    assert(inet_aton("10.0.2.0",&cfg.vnetwork));assert(inet_aton("255.255.255.0",&cfg.vnetmask));
++    assert(inet_aton("10.0.2.254",&cfg.vhost));assert(inet_aton("10.0.2.15",&cfg.vdhcp_start));assert(inet_aton("10.0.2.3",&cfg.vnameserver));
++    SlirpCb cb={.send_packet=output,.guest_error=error,.clock_get_ns=clock_ns,.timer_new=timer_new,.timer_free=timer_free,.timer_mod=timer_mod,.notify=notice,.register_poll_socket=register_socket,.unregister_poll_socket=unregister_socket};
++    stack=slirp_new(&cfg,&cb,NULL);assert(stack);
++    struct in_addr endpoint;assert(inet_aton("10.0.2.2",&endpoint));assert(slirp_add_unix(stack,argv[1],&endpoint,8888)==0);
++    tcp(2,NULL,0);drain();
++    for(int attempt=0;attempt<10&&!synacks;attempt++){
++        npfds=0;uint32_t timeout=10;slirp_pollfds_fill_socket(stack,&timeout,add_poll,NULL);
++        assert(poll(pfds,npfds,timeout)>=0);slirp_pollfds_poll(stack,0,revents,NULL);drain();
++    }
++    if(synacks!=1){char *info=slirp_connection_info(stack);fprintf(stderr,"handshake frames%zu synacks%d %s",tail,synacks,info);g_free(info);}
++    assert(synacks==1);
++    int peer=accept4(listener,NULL,NULL,SOCK_CLOEXEC|SOCK_NONBLOCK);assert(peer>=0);
++    if(!strcmp(argv[2],"close-before-data")){assert(close(peer)==0);peer=-1;}
++    else assert(!strcmp(argv[2],"open-peer"));
++    const char payload[]="GET /cmd HTTP/1.1\r\nHost: 10.0.2.2:8888\r\nConnection: close\r\n\r\n";
++    tcp(24,payload,sizeof(payload)-1);drain();
++    if(peer>=0){char buf[256];ssize_t n=recv(peer,buf,sizeof(buf),0);assert(n==(ssize_t)(sizeof(payload)-1) && !memcmp(buf,payload,n));}
++    uint64_t start=ns(CLOCK_MONOTONIC),cpu=ns(CLOCK_PROCESS_CPUTIME_ID),iterations=0,ready=0,hup=0;
++    int first_fd=-1,first_events=0,first_revents=0;unsigned maxfds=0;
++    while(ns(CLOCK_MONOTONIC)-start<300000000){
++        npfds=0;uint32_t timeout=10;slirp_pollfds_fill_socket(stack,&timeout,add_poll,NULL);
++        if((unsigned)npfds>maxfds)maxfds=npfds;
++        int ret=poll(pfds,npfds,timeout);assert(ret>=0);iterations++;if(ret>0)ready++;
++        for(int i=0;i<npfds;i++)if(pfds[i].revents){if(first_fd<0){first_fd=pfds[i].fd;first_events=pfds[i].events;first_revents=pfds[i].revents;}if(pfds[i].revents&POLLHUP)hup++;}
++        slirp_pollfds_poll(stack,0,revents,NULL);drain();
++    }
++    cpu=ns(CLOCK_PROCESS_CPUTIME_ID)-cpu;uint64_t wall=ns(CLOCK_MONOTONIC)-start;
++    char *info=slirp_connection_info(stack);fprintf(stderr,"%s",info);g_free(info);
++    printf("{\"mode\":\"%s\",\"slirp\":\"%s\",\"wall_ns\":%llu,\"cpu_ns\":%llu,\"iterations\":%llu,\"ready_polls\":%llu,\"hup_rows\":%llu,\"max_fds\":%u,\"first_fd\":%d,\"first_events\":%d,\"first_revents\":%d,\"synacks\":%d,\"fins\":%d,\"rsts\":%d}\n",argv[2],slirp_version_string(),(unsigned long long)wall,(unsigned long long)cpu,(unsigned long long)iterations,(unsigned long long)ready,(unsigned long long)hup,maxfds,first_fd,first_events,first_revents,synacks,fins,rsts);
++    int spin_failure=!strcmp(argv[2],"close-before-data") && ready>=4;
++    slirp_cleanup(stack);assert(registered==unregistered && registered==1);if(peer>=0)assert(close(peer)==0);assert(close(listener)==0);assert(unlink(argv[1])==0);
++    return spin_failure ? 1 : 0;
++}

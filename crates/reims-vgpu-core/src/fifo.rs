@@ -423,6 +423,12 @@ impl<P: Platform> Fifo<P> {
     /// Sets the fault offset (and a child's node's).
     pub fn set_fault_offset(&self, offset: u32) {
         self.ring.set_fault_offset(offset);
+        // faultoffset: FIFO stamp index, offset (u32::MAX clears the latch). This includes
+        // resume and restoration, unlike a command's dispatch/completion events alone.
+        crate::trace::event(
+            "faultoffset",
+            &[u64::from(self.stamp_index()), u64::from(offset)],
+        );
     }
 
     /// Faults the pending stamp `stamp_value` at `offset`.

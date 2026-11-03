@@ -548,7 +548,7 @@ impl Shape {
 
     /// Writes `luma(x, y)` into each sample of `surface`'s plane 0 and `chroma(x, y)` (Cb, Cr)
     /// into each of plane 1's, whole samples, low bits included; of a packed shape, each the
-    /// low 10 bits into its code's place in its word.
+    /// low 10 bits into its code's place in its word. The write is declared to the surface.
     pub(crate) fn fill(
         &self,
         surface: &OsSurface,
@@ -596,6 +596,7 @@ impl Shape {
                 write(at + element, cr);
             }
         }
+        surface.cpu_wrote();
     }
 
     /// [`Shape::fill`] of a packed shape: code `i` of a row in its word `i / 3`, at bits
@@ -639,6 +640,7 @@ impl Shape {
                 write(&c_plane, y, 2 * x + 1, cr);
             }
         }
+        surface.cpu_wrote();
     }
 
     /// Fills `surface` with codes: `luma(x, y)` and `chroma(x, y)` (Cb, Cr), each stored in its

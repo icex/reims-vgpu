@@ -112,6 +112,42 @@ pub fn event_at(at: u64, kind: &str, values: &[u64]) {
     write_line(&line);
 }
 
+/// The trace's time now, to start a span ([`span`]); `None` with the trace off, where no clock
+/// is read.
+pub fn span_start() -> Option<u64> {
+    on().then(now)
+}
+
+/// Writes the `sp` event of a span begun at `start` ([`span_start`]), timed at its end: `site`,
+/// the nanoseconds since `start`, then `values`; nothing for a `start` of `None`. The sites and
+/// their values are listed with the platform's (the Vulkan platform's `gpu::timing::span`).
+pub fn span(site: u64, start: Option<u64>, values: &[u64]) {
+    let Some(start) = start else {
+        return;
+    };
+    write_span(site, start, now(), values);
+}
+
+/// [`span`]'s event of a span from `start` to `end`, both read by [`span_start`], written now:
+/// for a step timed under a lock other threads take, its event written once the lock is let go.
+/// Nothing where either is `None`.
+pub fn span_to(site: u64, start: Option<u64>, end: Option<u64>, values: &[u64]) {
+    let (Some(start), Some(end)) = (start, end) else {
+        return;
+    };
+    write_span(site, start, end, values);
+}
+
+/// The `sp` event of a span from `start` to `end`, timed at `end`.
+fn write_span(site: u64, start: u64, end: u64, values: &[u64]) {
+    let mut line = Vec::with_capacity(2 + values.len());
+    line.push(site);
+    line.push(end.saturating_sub(start));
+    line.extend_from_slice(values);
+    // sp: site, nanoseconds, then the site's values
+    event_at(end, "sp", &line);
+}
+
 /// Writes one event whose last value is text (a label: its spaces become `_`).
 pub fn event_text(kind: &str, values: &[u64], text: &str) {
     if !on() {
@@ -164,7 +200,7 @@ fn thread_number() -> u64 {
 mod tests {
     use super::*;
 
-    /// Without the variable nothing is written, whatever the clock
+    /// Without the variable nothing is written, whatever the clock, and a span reads no clock
     #[test]
     fn off_without_the_variable() {
         // nextest runs each test in a process of its own, where the variable is not set
@@ -173,11 +209,16 @@ mod tests {
         assert!(!on());
         event("cmd", &[1, 2]);
         event_text("cbcommit", &[1], "a label");
+        let start = span_start();
+        assert_eq!(start, None);
+        span(40, start, &[1]);
+        span_to(41, start, Some(9), &[]);
         assert_eq!(now(), 7);
     }
 
     /// With a file, each event is a line, its thread's name written once before its first, a
-    /// text's spaces as `_`; a death's flush writes what the buffer held
+    /// text's spaces as `_`, a span as its site, nanoseconds and values, timed at its end (one
+    /// missing an end is none); a death's flush writes what the buffer held
     #[test]
     fn a_line_per_event() {
         // nextest runs each test in a process of its own, where the file is this one
@@ -188,6 +229,11 @@ mod tests {
         event("imp", &[6, 0x4000, 64, 0x4000]);
         event_text("cbcommit", &[1], "a label");
         event("impfree", &[0x4000]);
+        let start = span_start();
+        assert_eq!(start, Some(7));
+        span(40, start, &[3, 4]);
+        span_to(41, Some(2), start, &[]);
+        span_to(42, None, start, &[]);
         flush_before_death();
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -199,7 +245,7 @@ mod tests {
             text,
             format!(
                 "7 1 thread 1 {name}\n7 1 imp 6 16384 64 16384\n7 1 cbcommit 1 a_label\n\
-                 7 1 impfree 16384\n"
+                 7 1 impfree 16384\n7 1 sp 40 0 3 4\n7 1 sp 41 5\n"
             )
         );
     }

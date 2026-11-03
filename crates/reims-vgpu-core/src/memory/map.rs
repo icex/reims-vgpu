@@ -8,6 +8,7 @@ use crate::guest::records::APV_PAGE_SIZE;
 use crate::host::{HostPtr, PhysRange};
 use crate::memory::DeathKind;
 use crate::memory::descriptor::MemoryMapDescriptor;
+use crate::memory::kept::KeptLimits;
 use crate::memory::mapping::{Mapping, Teardown};
 use crate::num::{ToU64, ToUsize};
 use crate::platform::Platform;
@@ -270,6 +271,24 @@ impl<P: Platform> MemoryMap<P> {
         total_length: u64,
         read_only: u32,
     ) -> Option<Arc<Mapping<P>>> {
+        self.range_mapping(ranges, total_length, read_only)
+            .map(|(mapping, _)| mapping)
+    }
+
+    /// What a task may keep of the mappings its transfer buffers were made over: the platform's
+    /// word ([`crate::memory::kept`]).
+    pub fn kept_limits(&self) -> KeptLimits {
+        self.platform.vm().kept_mapping_limits()
+    }
+
+    /// [`MemoryMap::new_range_mapping`], and whether its protect held: a mapping whose protect
+    /// failed lies over a range already deallocated.
+    pub(crate) fn range_mapping(
+        &self,
+        ranges: &[PhysRange],
+        total_length: u64,
+        read_only: u32,
+    ) -> Option<(Arc<Mapping<P>>, bool)> {
         let vm = self.platform.vm();
         // A total length of 0 passes the assert.
         crate::fatal_unless!(
@@ -356,19 +375,21 @@ impl<P: Platform> MemoryMap<P> {
         } else {
             VmProt::READ | VmProt::WRITE
         };
-        if vm.protect_max(address, total_length, prot).is_err() {
+        let protected = vm.protect_max(address, total_length, prot).is_ok();
+        if !protected {
             // Deallocated, then the mapping is made anyway.
             free_all();
         }
         // Writable unless read-only; making the mapping never fails.
-        Some(Mapping::new(
+        let mapping = Mapping::new(
             address,
             total_length,
             read_only == 0,
             Teardown::Vm {
                 platform: self.platform.clone(),
             },
-        ))
+        );
+        Some((mapping, protected))
     }
 
     /// Copies `dst.len()` bytes from guest physical `physical`; false when no range holds them.
@@ -1425,6 +1446,148 @@ mod tests {
             let dst = region(&p, PAGE);
             assert!(m.map_memory_at_virtual_address(dst, &[], false));
             assert_eq!(vm_calls(&p)[0].args[1], Arg::U64(0));
+        }
+    }
+
+    mod kept_mappings {
+        use super::*;
+        use crate::memory::kept::{self, KeptLimits, KeptMappings};
+
+        const ROOMY: KeptLimits = KeptLimits {
+            entries: 8,
+            bytes: 64 * PAGE,
+            runs: 64,
+        };
+
+        /// Held by each test here: `release_all` reaches every live task's kept mappings, those of
+        /// tests running beside it in one process among them.
+        static ONE_AT_A_TIME: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
+        fn allocations(p: &FakePlatform) -> usize {
+            p.call_log().count("mach_vm_allocate")
+        }
+
+        fn deallocations(p: &FakePlatform) -> usize {
+            p.call_log().count("mach_vm_deallocate")
+        }
+
+        /// The same runs, length and writability of the same map take the kept mapping, held
+        /// past its first holder's release; other runs, another writability or another map make
+        /// a fresh one, and nothing is deallocated until the kept ones go at `clear`
+        #[test]
+        fn the_same_runs_take_the_kept_mapping() {
+            let _one = ONE_AT_A_TIME.lock();
+            let p = plat();
+            p.fake_vm().set_kept_limits(ROOMY);
+            let (_ram, m) = ram_map(&p, &[(0x4000, 0x10000)]);
+            let kept = KeptMappings::new();
+            let runs = [pr(0x4000, PAGE), pr(0xc000, PAGE)];
+            let first = kept.mapping(&m, &runs, 2 * PAGE, 0).unwrap();
+            let va = first.virtual_address();
+            drop(first);
+            assert_eq!((allocations(&p), deallocations(&p)), (1, 0));
+            let again = kept.mapping(&m, &runs, 2 * PAGE, 0).unwrap();
+            assert_eq!(again.virtual_address(), va);
+            assert_eq!(allocations(&p), 1, "no fresh mapping");
+            // Another run, read-only, another map: each fresh
+            let other = kept
+                .mapping(&m, &[pr(0x4000, 2 * PAGE)], 2 * PAGE, 0)
+                .unwrap();
+            let read_only = kept.mapping(&m, &runs, 2 * PAGE, 1).unwrap();
+            assert!(!read_only.writable());
+            let copy = m.copy();
+            let of_copy = kept.mapping(&copy, &runs, 2 * PAGE, 0).unwrap();
+            assert_ne!(other.virtual_address(), va);
+            assert_eq!(allocations(&p), 4);
+            assert_eq!(kept.kept(), 4);
+            drop((again, other, read_only, of_copy));
+            assert_eq!(deallocations(&p), 0);
+            kept.clear();
+            assert_eq!((kept.kept(), deallocations(&p)), (0, 4));
+        }
+
+        /// Past the limits the least recently used go; a mapping past them alone is never kept;
+        /// with none allowed every mapping is fresh and goes with its last holder
+        #[test]
+        fn past_the_limits_the_least_recently_used_go() {
+            let _one = ONE_AT_A_TIME.lock();
+            let p = plat();
+            let (_ram, m) = ram_map(&p, &[(0x4000, 0x20000)]);
+            let kept = KeptMappings::new();
+            let one = |page: u64| [pr(0x4000 + page * PAGE, PAGE)];
+            // None allowed
+            drop(kept.mapping(&m, &one(0), PAGE, 0).unwrap());
+            drop(kept.mapping(&m, &one(0), PAGE, 0).unwrap());
+            assert_eq!((allocations(&p), deallocations(&p), kept.kept()), (2, 2, 0));
+            p.fake_vm().set_kept_limits(KeptLimits {
+                entries: 2,
+                bytes: 3 * PAGE,
+                runs: 3,
+            });
+            let a = kept
+                .mapping(&m, &one(0), PAGE, 0)
+                .unwrap()
+                .virtual_address();
+            drop(kept.mapping(&m, &one(1), PAGE, 0).unwrap());
+            // `a` used again, so the third pushes out the second
+            assert_eq!(
+                kept.mapping(&m, &one(0), PAGE, 0)
+                    .unwrap()
+                    .virtual_address(),
+                a
+            );
+            drop(kept.mapping(&m, &one(2), PAGE, 0).unwrap());
+            assert_eq!((kept.kept(), deallocations(&p)), (2, 3));
+            assert_eq!(
+                kept.mapping(&m, &one(0), PAGE, 0)
+                    .unwrap()
+                    .virtual_address(),
+                a
+            );
+            assert_eq!(allocations(&p), 5);
+            // Bytes: four pages alone pass three, and are not kept
+            let big = [pr(0x4000, 4 * PAGE)];
+            drop(kept.mapping(&m, &big, 4 * PAGE, 0).unwrap());
+            assert_eq!((kept.kept(), deallocations(&p)), (2, 4));
+            // Runs: two runs of a page and a two-page one make four runs past three, so the
+            // least recently used goes
+            drop(
+                kept.mapping(&m, &[pr(0x4000, PAGE), pr(0xc000, PAGE)], 2 * PAGE, 0)
+                    .unwrap(),
+            );
+            assert_eq!((kept.kept(), deallocations(&p)), (2, 5));
+            drop(kept);
+            assert_eq!(deallocations(&p), 7);
+        }
+
+        /// A mapping whose protect failed lies over a deallocated range: never kept
+        #[test]
+        fn a_failed_protect_is_never_kept() {
+            let _one = ONE_AT_A_TIME.lock();
+            let p = plat();
+            p.fake_vm().set_kept_limits(ROOMY);
+            let (_ram, m) = ram_map(&p, &[(0x4000, 0x8000)]);
+            let kept = KeptMappings::new();
+            p.script()
+                .push("mach_vm_protect", Step::value(KernReturn(4)));
+            drop(kept.mapping(&m, &[pr(0x4000, PAGE)], PAGE, 0).unwrap());
+            assert_eq!(kept.kept(), 0);
+            drop(kept.mapping(&m, &[pr(0x4000, PAGE)], PAGE, 0).unwrap());
+            assert_eq!((allocations(&p), kept.kept()), (2, 1));
+        }
+
+        /// `release_all` lets every live task's kept mappings go
+        #[test]
+        fn release_all_reaches_every_task() {
+            let _one = ONE_AT_A_TIME.lock();
+            let p = plat();
+            p.fake_vm().set_kept_limits(ROOMY);
+            let (_ram, m) = ram_map(&p, &[(0x4000, 0x8000)]);
+            let (a, b) = (KeptMappings::new(), KeptMappings::new());
+            drop(a.mapping(&m, &[pr(0x4000, PAGE)], PAGE, 0).unwrap());
+            drop(b.mapping(&m, &[pr(0x8000, PAGE)], PAGE, 0).unwrap());
+            kept::release_all();
+            assert_eq!((a.kept(), b.kept(), deallocations(&p)), (0, 0, 2));
         }
     }
 }

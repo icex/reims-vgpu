@@ -137,7 +137,8 @@ pub(super) fn held() -> u64 {
 }
 
 /// Lets `what` add up to `adding` mappings, or ends the process where the views would pass the
-/// budget with them, at the limit read again (module docs): the death names `what`, the
+/// budget with them, at the limit read again and with the mappings tasks keep for their next
+/// transfer buffers let go (module docs): the death names `what`, the
 /// mappings the views hold and the process holds, the limit, the reserve and the setting that
 /// gives room. Threads that weigh views at once may pass it by what they add between them, which
 /// the reserve covers.
@@ -148,6 +149,14 @@ pub(super) fn admit(adding: u64, what: &'static str) {
         return;
     }
     let limit = reread();
+    if wanted <= budget(limit) {
+        return;
+    }
+    // The mappings tasks keep for their next transfer buffers go first: without them the views
+    // hold what they would have held had none been kept (`crate::remap::KEPT_MAPPINGS`).
+    reims_vgpu_core::memory::kept::release_all();
+    let held = self::held();
+    let wanted = held.saturating_add(adding);
     if wanted <= budget(limit) {
         return;
     }

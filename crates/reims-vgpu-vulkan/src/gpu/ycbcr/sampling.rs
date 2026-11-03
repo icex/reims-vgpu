@@ -1443,6 +1443,7 @@ fn after<P: Platform<Surface = OsSurface>>(
             // SAFETY: plane 0's first row, inside the surface's allocation, which no GPU
             // work uses now.
             unsafe { std::ptr::write_bytes(base, 0, n) };
+            s.cpu_wrote();
             run(&read);
         }
         Write::Fenced => run(&|cb| {

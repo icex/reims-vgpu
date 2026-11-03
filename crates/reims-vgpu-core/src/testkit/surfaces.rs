@@ -155,6 +155,12 @@ impl Fk<kind::Surface> {
     pub fn lock_count(&self) -> i64 {
         self.with_surface(|m| m.lock_count).unwrap_or(0)
     }
+
+    /// The outstanding locks at each `cpu_wrote` so far, in order.
+    pub fn cpu_writes(&self) -> Vec<i64> {
+        self.with_surface(|m| m.cpu_writes.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl Surface for Fk<kind::Surface> {
@@ -225,6 +231,12 @@ impl Surface for Fk<kind::Surface> {
         })
     }
 
+    /// Noted with the outstanding locks ([`Fk::cpu_writes`]); no call is logged, as IOSurface
+    /// has none.
+    fn cpu_wrote(&self) {
+        let _ = self.with_surface(|m| m.cpu_writes.push(m.lock_count));
+    }
+
     fn alloc_size(&self) -> u64 {
         self.get_u64("IOSurfaceGetAllocSize", |m| m.alloc_size)
     }
@@ -248,6 +260,7 @@ impl Surface for Fk<kind::Surface> {
             protection_options: m.protection_options,
             allows_pixel_size_casting: m.allows_pixel_size_casting,
             lock_count: m.lock_count,
+            cpu_writes: Vec::new(),
             spec: m.spec.clone(),
             backing_spec: m.backing_spec.clone(),
         })?;

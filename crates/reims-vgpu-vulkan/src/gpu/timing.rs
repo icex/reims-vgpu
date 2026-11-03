@@ -46,6 +46,7 @@ use std::time::Duration;
 
 use metal2vulkan::pipeline::{RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime as rt;
+use reims_vgpu_core::num::ToU64 as _;
 use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
 
 use crate::os::OsClock;
@@ -304,6 +305,74 @@ pub fn trace_clock() -> u64 {
     nanos(rt::host_time())
 }
 
+/// The trace's time now, where its events are written, to start a span ([`span`]); `None` with
+/// the trace off, where no clock is read.
+pub fn span_start() -> Option<u64> {
+    trace::span_start()
+}
+
+/// Writes the trace's `sp` event of a span begun at `start` ([`span_start`]), timed at its end:
+/// `site`, the nanoseconds since `start`, then `values`; nothing for a `start` of `None`. Each
+/// site's comment names its values. A span's time holds the events its nested spans wrote. No
+/// span is written per range or per command a step walks, nor while a lock other threads take
+/// is held ([`span_to`]): each such step's counts are its enclosing span's values. Core writes
+/// its own through [`trace::span`], the same event. The sites, in the order a buffer and a
+/// texture on a surface reach them:
+/// - 1-5, `VulkanDevice::buffer_over_surface_at`: 1 the memory hold and keep-alive of a buffer at
+///   the surface's base address; 2 the surface's alias of its allocation, gathered where none
+///   lives; 3 the runtime's `new_buffer_with_descriptor`; 4 the base anchor's check, making and
+///   keeping; 5 the whole call.
+/// - 6-7, `VulkanDevice::new_buffer_on_surface` (`newBufferWithIOSurface:`): 6 the whole call
+///   from the surface taken; 7 the platform's buffer made of the runtime's and kept among the
+///   surface's buffers (`keep_surface_buffer`).
+/// - 10-14, `VulkanDevice::new_texture_on_surface`: 10 its buffer over the surface; 11 the
+///   runtime's `new_texture_with_iosurface_plane`; 12 the texture's memory
+///   (`writes::texture_memory`); 13 `over_pages::over_surface`; 14 the whole call from the
+///   descriptor made.
+/// - 20, 21, 23, `os::surface`: 20 `surface_memory`, 21 `surface_bytes_memory`, 23 the copy of
+///   the surface's record (`made_over`).
+/// - 30-35, `gpu::over_pages`: 30 `Site::fixed`'s naming of the memory as the guest's
+///   (`remap::as_guests`), 31 `Watch::other_then`, 32 its wait for the registry's lock, 33 its
+///   check (`Registry::under`), 34 its keeping (`Registry::keep`), 35 `Seen::keep`.
+/// - 40-52, core's exec (`LocalTask::exec_indirect`), each with the task's id first: 40 the wait
+///   for the task's shared lock; 41 the object lists' mapping (`ensure_mapped`); 42 the whole
+///   preparation (`prepare_resources`, its lock's wait included), then the resources listed and
+///   those paged by a blit, a compute encoder and the CPU; 43 the preparation's lookups, each
+///   resource made on first use (texture and shadow-image creations among them), then the
+///   resources listed; 44 the paging buffer made, its wait on the FIFO's event encoded and its
+///   blit encoder opened, the work a paging exec does before its first page-up; 45 the page-ups
+///   encoded (`prepare_in_encoder` and `prepare_in_compute_encoder` of each, the transfer
+///   buffers' mappings and imports among them), then the blit and compute resources; 46 the
+///   paging buffer's signal and commit; 47 the exec's command buffer made and its wait on the
+///   paging event encoded; 48 the copies of its command buffers (`cursors`), then their count
+///   and bytes; 49 the decode (`decode_segments`), then the segments; 50 the completion handler
+///   added, the FIFO event's signal encoded and the commit; 51 the synchronize buffer
+///   (`complete_resources`); 52 the whole exec from its lock taken. An isolated task's exec
+///   (`GpuTask::exec_job`) writes the same sites but 43-46, its 42 with the resources listed
+///   alone.
+/// - 55-57, core's render decoder, once per segment: 55 the pass opened, its prefix decoded and
+///   `renderCommandEncoderWithDescriptor:`; 56 the segment's records, then their count and the
+///   draws among them; 57 the pass's `endEncoding`.
+/// - 60-64, core's deletes and creations: 60 a delete's wait for the task's unique lock
+///   (`DeleteResource` and the serialized delete); 61 a resource's delete under the lock, its
+///   placement slot's clear and the release of a resource that may reach the host among them,
+///   then the reference and whether the resource went after the lock (one whose release reaches
+///   the platform alone, `Resource::releases_internally`); 62 a serialized delete under the lock,
+///   then whether a resource went after it; 63 an object made on its first use (`new_object`),
+///   the kind's own creation (a texture's image and its shadow among it), then the reference and
+///   the object type; 64 a deleted resource's release after the lock, then the reference. 60-62
+///   are written once the lock is let go.
+pub fn span(site: u64, start: Option<u64>, values: &[u64]) {
+    trace::span(site, start, values);
+}
+
+/// [`span`]'s event of a span from `start` to `end`, both read by [`span_start`], written now:
+/// for a step timed under a lock, its event written once the lock is let go. Nothing where
+/// either is `None`.
+pub fn span_to(site: u64, start: Option<u64>, end: Option<u64>, values: &[u64]) {
+    trace::span_to(site, start, end, values);
+}
+
 /// The draws encoded while the trace is on, which [`work_counts`] writes.
 static DRAWS: AtomicU64 = AtomicU64::new(0);
 
@@ -328,6 +397,17 @@ fn work_counts(cb: &rt::CommandBuffer) {
         return;
     }
     let c = cb.command_queue().device().work_counts();
+    // wsubmit: the sampling command buffer, driver calls, submitted Vulkan buffers, and
+    // batches that shared a driver call. The command buffer's other events name its queue.
+    trace::event(
+        "wsubmit",
+        &[
+            id(cb),
+            c.queue_submissions,
+            c.command_buffers_submitted,
+            c.batches_grouped,
+        ],
+    );
     // wc: the counts named in the order written, then the draws
     trace::event(
         "wc",
@@ -345,6 +425,53 @@ fn work_counts(cb: &rt::CommandBuffer) {
             c.creation_pipelines_made,
             c.kept_backings_made,
             DRAWS.load(Ordering::Relaxed),
+        ],
+    );
+    // wc2: host-memory imports live, released and reimported, then the texture shadows made, their
+    // copies and the texels copied in and back
+    trace::event(
+        "wc2",
+        &[
+            c.host_imports_live,
+            c.host_imports_released,
+            c.host_imports_reimported,
+            c.shadowed_textures,
+            c.shadow_copies,
+            c.shadow_texels_copied_in,
+            c.shadow_texels_copied_back,
+        ],
+    );
+    // wc3: dma-buf imports made and images made over them, the dma-buf memories of buffers and of
+    // images live, images shared, keep-alives dropped at their release, host-memory imports live,
+    // the surfaces' base anchors live, and the dma-buf descriptors kept for reimports
+    trace::event(
+        "wc3",
+        &[
+            c.dma_buf_imports,
+            c.dma_buf_images,
+            c.dma_buf_memories_live,
+            c.dma_buf_image_memories_live,
+            c.shared_alias_images,
+            c.host_keep_alives_covered,
+            c.host_imports_live,
+            crate::os::anchors_live().to_u64(),
+            c.host_import_fds_kept,
+        ],
+    );
+    // wc4: the shadows' copies in recorded apart, those left out as the image held the bytes
+    // still and the texels they would have moved, those kept as the memory's epoch had moved,
+    // the shadows left current that were not carried for a writer that may still run, the
+    // shadow images shared among a surface's textures, and the declarations the runtime withdrew
+    trace::event(
+        "wc4",
+        &[
+            c.shadow_copies_apart,
+            c.shadow_copies_carried,
+            c.shadow_texels_carried,
+            c.shadow_carries_moved,
+            c.shadow_carries_pending,
+            c.shadow_images_shared,
+            c.declared_memories_withdrawn,
         ],
     );
 }

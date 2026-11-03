@@ -201,3 +201,50 @@ fn a_synchronize_buffer_cleanup_raise_ends_the_synchronizes_raise() {
     drop(held);
     assert_eq!(Arc::strong_count(&p.td.device), device);
 }
+
+/// A walk's page-table reads hold the device to the end of their hold's holder, one reference
+/// per holder however many reads it makes: two copies through a two-level table, four reads,
+/// leave the command's holder holding one; a holder of its own holds its own
+#[test]
+fn page_table_reads_hold_the_device_once_per_holder() {
+    let td = device(Opts::default()).with_root_page();
+    let ram = td.host.ram();
+    td.platform.fake_vm().sync();
+    // Depth 2, the root table at page 0x56, its first entry the table at 0x57, whose first
+    // three entries are writable pages 0x60 to 0x62
+    assert!(ram.write_u32(0x55 * APV_PAGE_SIZE, 0x56));
+    assert!(ram.write_u32(0x55 * APV_PAGE_SIZE + 4, 2));
+    assert!(ram.write_u64(0x55 * APV_PAGE_SIZE + 0x14, 3 * APV_PAGE_SIZE));
+    assert!(ram.write_u32(0x56 * APV_PAGE_SIZE, 0x8000_0057));
+    for i in 0..3 {
+        assert!(ram.write_u32(0x57 * APV_PAGE_SIZE + 4 * i, 0x8000_0060 + i as u32));
+        assert!(ram.write_u32((0x60 + i) * APV_PAGE_SIZE + 8, 0xa0 + i as u32));
+    }
+    td.platform.fake_vm().sync();
+    td.device
+        .create_task_id(Hold::NONE, 0, 0x55, 3 * APV_PAGE_SIZE, false)
+        .unwrap();
+    let crate::tasks::Task::Local(task) = td.device.get_task_id(OnFault::Return, 0).unwrap() else {
+        panic!("no local kernel task")
+    };
+    let held = Held::new();
+    let mut words = [0u8; 4];
+    let mut read = |at: u64| {
+        task.copy(Hold::of(&held), OnFault::Return, at, &mut words)
+            .unwrap();
+        u32::from_le_bytes(words)
+    };
+    assert_eq!(read(8), 0xa0);
+    assert_eq!(read(2 * APV_PAGE_SIZE + 8), 0xa2);
+    assert_eq!(format!("{held:?}"), "Held { values: 1 }");
+    let other = Held::new();
+    task.copy(
+        Hold::of(&other),
+        OnFault::Return,
+        APV_PAGE_SIZE + 8,
+        &mut words,
+    )
+    .unwrap();
+    assert_eq!(u32::from_le_bytes(words), 0xa1);
+    assert_eq!(format!("{other:?}"), "Held { values: 1 }");
+}

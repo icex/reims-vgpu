@@ -1271,9 +1271,60 @@ const RELAYED_ONCE: [rt::Degradation; 7] = [
     rt::Degradation::HalfOutputPrecision,
 ];
 
-/// The kinds of [`RELAYED_ONCE`] this process relayed.
-static RELAYED_KINDS: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
-    reims_vgpu_core::sync::Mutex::new(Vec::new());
+/// The kinds of [`RELAYED_ONCE`] this process relayed, a bit each, by their places there.
+static RELAYED_KINDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const _: () = assert!(RELAYED_ONCE.len() <= 64);
+
+/// Where a kind stands in the sink's lists, looked up once per notice ([`class`]) in place of a
+/// scan of each list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Class {
+    /// Its first place in [`DIES`].
+    dies: Option<usize>,
+    /// Whether it is of [`HEARD`].
+    heard: bool,
+    /// Its first place in [`RELAYED_ONCE`].
+    relayed_once: Option<usize>,
+    /// Whether it is of [`DIES_BY_DEFAULT`].
+    dies_by_default: bool,
+    /// Its first place in [`native::NATIVE_RELAYED`].
+    native: Option<usize>,
+}
+
+/// The class of each kind a list names, in the kinds' order.
+static CLASSES: std::sync::LazyLock<Vec<(rt::Degradation, Class)>> =
+    std::sync::LazyLock::new(|| {
+        let mut classes = std::collections::BTreeMap::<rt::Degradation, Class>::new();
+        for (at, &kind) in DIES.iter().enumerate() {
+            classes.entry(kind).or_default().dies.get_or_insert(at);
+        }
+        for &kind in &HEARD {
+            classes.entry(kind).or_default().heard = true;
+        }
+        for (at, &kind) in RELAYED_ONCE.iter().enumerate() {
+            classes
+                .entry(kind)
+                .or_default()
+                .relayed_once
+                .get_or_insert(at);
+        }
+        for &kind in &DIES_BY_DEFAULT {
+            classes.entry(kind).or_default().dies_by_default = true;
+        }
+        for (at, r) in native::NATIVE_RELAYED.iter().enumerate() {
+            classes.entry(r.kind).or_default().native.get_or_insert(at);
+        }
+        classes.into_iter().collect()
+    });
+
+/// Where `kind` stands in the sink's lists: in none for a kind no list names.
+fn class(kind: rt::Degradation) -> Class {
+    CLASSES
+        .binary_search_by(|(k, _)| k.cmp(&kind))
+        .ok()
+        .and_then(|at| CLASSES.get(at))
+        .map_or_else(Class::default, |&(_, class)| class)
+}
 
 thread_local! {
     /// How many calls here this thread is inside.
@@ -1331,8 +1382,8 @@ static RELAYED_DIES: [std::sync::atomic::AtomicU64; DIES.len()] =
 /// line is written.
 fn count_relayed(kind: rt::Degradation) -> bool {
     use std::sync::atomic::Ordering;
-    DIES.iter()
-        .position(|&k| k == kind)
+    class(kind)
+        .dies
         .and_then(|at| RELAYED_DIES.get(at))
         .is_some_and(|c| c.fetch_add(1, Ordering::Relaxed) == 0)
 }
@@ -1434,11 +1485,12 @@ enum Fate {
 /// The fate of `kind`, a kind of [`DIES`], under `placement`, with census mode and strict mode
 /// each on or off.
 fn fate(kind: rt::Degradation, placement: native::Placement, census: bool, strict: bool) -> Fate {
-    if placement == native::Placement::Native && native::relayed(kind) {
+    let class = class(kind);
+    if placement == native::Placement::Native && class.native.is_some() {
         Fate::RelayedNatively
     } else if census {
         Fate::Counted
-    } else if strict || DIES_BY_DEFAULT.contains(&kind) {
+    } else if strict || class.dies_by_default {
         Fate::Dies
     } else {
         Fate::Relayed
@@ -1475,6 +1527,53 @@ static TRACED_KINDS: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
 /// a kind of [`RELAYED_ONCE`] after its first.
 pub fn notice(message: &rt::DebugMessage) {
     let Some(notice) = &message.degradation else {
+        if matches!(
+            message.id_name.as_str(),
+            "metal2vulkan-variant-identity"
+                | "metal2vulkan-variant-use"
+                | "metal2vulkan-render-time-encode"
+                | "metal2vulkan-render-time-done"
+                | "metal2vulkan-render-time-skip"
+                | "metal2vulkan-render-time-scope"
+                | "metal2vulkan-render-time-draw"
+                | "metal2vulkan-render-time-midpoint"
+                | "metal2vulkan-render-preparation-copy"
+                | "metal2vulkan-render-preparation-encode"
+                | "metal2vulkan-render-preparation-done"
+        ) {
+            let mut parts = message.text.splitn(3, ' ');
+            if let (Some(pid), Some(number)) = (
+                parts.next().and_then(|v| v.parse::<u64>().ok()),
+                parts.next().and_then(|v| v.parse::<u64>().ok()),
+            ) {
+                let kind = match message.id_name.as_str() {
+                    "metal2vulkan-variant-identity" => "gpmeta",
+                    "metal2vulkan-variant-use" => "gpuse",
+                    "metal2vulkan-render-time-encode" => "gprenc",
+                    "metal2vulkan-render-time-done" => "gprdone",
+                    "metal2vulkan-render-time-scope" => "gprscope",
+                    "metal2vulkan-render-time-draw" => "gprdraw",
+                    "metal2vulkan-render-time-midpoint" => "gprmid",
+                    "metal2vulkan-render-preparation-copy" => "gppcopy",
+                    "metal2vulkan-render-preparation-encode" => "gppenc",
+                    "metal2vulkan-render-preparation-done" => "gppdone",
+                    _ => "gprskip",
+                };
+                reims_vgpu_core::trace::event_text(
+                    kind,
+                    &[pid, number],
+                    parts.next().unwrap_or(""),
+                );
+            }
+            return;
+        }
+        if message.id_name == TEXTURE_STORAGE {
+            // tstor: the runtime's line of a texture over a buffer's storage, its fields after
+            // its prefix, `key=value` each, `why` last (spaces as `_`, as every text's)
+            let fields = message.text.strip_prefix(TEXTURE_STORAGE_PREFIX);
+            reims_vgpu_core::trace::event_text("tstor", &[], fields.unwrap_or(&message.text));
+            return;
+        }
         relay(message);
         return;
     };
@@ -1483,7 +1582,8 @@ pub fn notice(message: &rt::DebugMessage) {
         // deg: an occurrence of a degradation, its code
         reims_vgpu_core::trace::event_text("deg", &[], kind.code());
         // A kind announced once without the trace goes on only at its first occurrence.
-        if !DIES.contains(&kind) && !HEARD.contains(&kind) {
+        let class = class(kind);
+        if class.dies.is_none() && !class.heard {
             let mut seen = TRACED_KINDS.lock();
             if seen.contains(&kind) {
                 return;
@@ -1491,8 +1591,9 @@ pub fn notice(message: &rt::DebugMessage) {
             seen.push(kind);
         }
     }
-    if !DIES.contains(&notice.degradation) {
-        if HEARD.contains(&notice.degradation) {
+    let class = class(notice.degradation);
+    if class.dies.is_none() {
+        if class.heard {
             HEARING.with(|h| {
                 if let Some(heard) = h.borrow_mut().as_mut() {
                     heard.push(notice.degradation);
@@ -1501,12 +1602,12 @@ pub fn notice(message: &rt::DebugMessage) {
         }
         #[cfg(test)]
         RELAYED.lock().push(notice.degradation);
-        if RELAYED_ONCE.contains(&notice.degradation) {
-            let mut relayed = RELAYED_KINDS.lock();
-            if relayed.contains(&notice.degradation) {
+        if let Some(at) = class.relayed_once {
+            let bit = 1u64 << at;
+            let relayed = RELAYED_KINDS.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+            if relayed & bit != 0 {
                 return;
             }
-            relayed.push(notice.degradation);
         }
         relay(message);
         return;
@@ -1522,7 +1623,7 @@ pub fn notice(message: &rt::DebugMessage) {
         }
         Fate::RelayedNatively => {
             census::record(kind, &notice.object, true);
-            if native::count(kind) {
+            if class.native.is_some_and(native::count_at) {
                 relay(message);
             }
             return;
@@ -1552,6 +1653,19 @@ pub fn notice(message: &rt::DebugMessage) {
 #[cfg(test)]
 pub(crate) static RELAYED: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
     reims_vgpu_core::sync::Mutex::new(Vec::new());
+
+/// The id name of the runtime's line of each texture over a buffer's storage, which its devices
+/// send only where the trace is on (`DeviceOptions::log_texture_storage`, [`crate::platform`]):
+/// [`notice`] writes it to the trace alone, as a `tstor` event, never to stderr or the log.
+const TEXTURE_STORAGE: &str = "metal2vulkan-texture-storage";
+
+/// What the text of a [`TEXTURE_STORAGE`] line starts with, before its fields: `call` (the
+/// runtime's call the storage is made for: `new_texture_with_iosurface_plane` for a texture on a
+/// surface, `new_texture` for one over a buffer, a view's), `route`, `rule`, `format`, `extent` (width x height x layers), `pitch`, `offset`, `length` (the buffer's padded
+/// length), `usage` (Metal's bits), `decide`, `shadow`, `source` and `import` (nanoseconds: to
+/// the storage chosen, the shadow's making, inside the pages' dma-buf source, and the import and
+/// bind of what it made) and `why` (the shadow's reason, to the line's end).
+const TEXTURE_STORAGE_PREFIX: &str = "metal2vulkan: texture storage ";
 
 /// What the id names of the runtime's own messages start with: its degradations'
 /// (`metal2vulkan-degrade-`), its pipeline-creation log's (`metal2vulkan-pipeline-creation`) and
@@ -2035,6 +2149,22 @@ mod tests {
     use metal2vulkan_runtime::{Invalid, Problem, RuntimeGap};
     use reims_vgpu_core::raise::{Origin, RaiseId};
     use reims_vgpu_core::testkit::capture::catch_death;
+
+    /// Each kind's class says where it stands in every list the sink reads: its first place in
+    /// each that has places, and its membership of the others
+    #[test]
+    fn a_kind_s_class_is_its_places_in_the_lists() {
+        for &kind in rt::Degradation::ALL {
+            let expected = Class {
+                dies: DIES.iter().position(|&k| k == kind),
+                heard: HEARD.contains(&kind),
+                relayed_once: RELAYED_ONCE.iter().position(|&k| k == kind),
+                dies_by_default: DIES_BY_DEFAULT.contains(&kind),
+                native: native::NATIVE_RELAYED.iter().position(|r| r.kind == kind),
+            };
+            assert_eq!(class(kind), expected, "{kind:?}");
+        }
+    }
 
     fn invalid() -> Error {
         Error::Invalid(Invalid::new("fill_buffer", Problem::StorageMode))

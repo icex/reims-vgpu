@@ -90,6 +90,7 @@ pub struct Region {
 /// What a frame target holds.
 struct Target<P: Platform> {
     texture: P::Texture,
+    pixels: Option<Box<dyn crate::platform::FramePixels<P>>>,
     width: u32,
     height: u32,
     format: PixelFormat,
@@ -98,7 +99,8 @@ struct Target<P: Platform> {
 }
 
 /// A 2D texture the library draws frames into and reads pixels back from: one counted
-/// reference. It keeps only its texture, and may outlive the device it was made on.
+/// reference. It keeps its texture and optional pixel-copy storage, and may outlive the device
+/// it was made on.
 pub struct FrameTarget<P: Platform = DefaultPlatform> {
     inner: Ours<Arc<Target<P>>>,
 }
@@ -121,6 +123,7 @@ impl<P: Platform> FrameTarget<P> {
         width: u32,
         height: u32,
         format: PixelFormat,
+        pixels_factory: crate::platform::FramePixelsFactory<P>,
     ) -> Result<FrameTarget<P>, Error> {
         entry::run(|_| {
             let size = 1..=MAX_FRAME_TARGET_SIZE;
@@ -140,8 +143,10 @@ impl<P: Platform> FrameTarget<P> {
             let texture = no_catch(device.new_texture(OnFault::Die, &td));
             drop(td);
             let texture = texture.ok_or(Error::Metal)?;
+            let pixels = pixels_factory(platform, &texture);
             let target = Target {
                 texture,
+                pixels,
                 width,
                 height,
                 format,
@@ -181,6 +186,13 @@ impl<P: Platform> FrameTarget<P> {
         &self.inner.texture
     }
 
+    /// Append the platform's optional readback to this frame, without a submission or wait.
+    pub(crate) fn encode_pixels(&self, command_buffer: &P::CommandBuffer) {
+        if let Some(pixels) = &self.inner.pixels {
+            pixels.encode(command_buffer, &self.inner.texture);
+        }
+    }
+
     /// Whether both are references to one target.
     pub fn ptr_eq(&self, other: &FrameTarget<P>) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -207,9 +219,13 @@ impl<P: ApiPlatform> FrameTarget<P> {
                 return Err(Error::InvalidArgument);
             }
             let dst = dst.get_mut(..extent).ok_or(Error::InvalidArgument)?;
-            self.inner
-                .platform
-                .read_pixels(&self.inner.texture, dst, bytes_per_row);
+            if let Some(pixels) = &self.inner.pixels {
+                pixels.read(dst, bytes_per_row);
+            } else {
+                self.inner
+                    .platform
+                    .read_pixels(&self.inner.texture, dst, bytes_per_row);
+            }
             Ok(())
         })
     }

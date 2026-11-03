@@ -29,8 +29,9 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 pub(crate) use host_os::{
-    Drawables, METAL_LEVEL, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros, dma_buf_refusal,
-    host_memory, import_view, plane_shape, shown_at, surface_memory_hold,
+    Drawables, METAL_LEVEL, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros, anchors_live,
+    dma_buf_refusal, host_memory, import_view, keep_base_anchor, plane_shape, shown_at,
+    surface_declared, surface_memory_hold, wants_base_anchor,
 };
 pub use host_os::{
     GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, default_gpu_core_count,
@@ -38,6 +39,8 @@ pub use host_os::{
 };
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::has_base_anchor;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::MATRIX_KEY;
 pub use wsi::{add_window_extensions, present_fences};

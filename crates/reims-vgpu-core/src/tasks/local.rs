@@ -71,6 +71,7 @@ use crate::guest::records::{
     TaskRoot2,
 };
 use crate::memory::cursor::{Cursor, WritableCursor};
+use crate::memory::kept::KeptMappings;
 use crate::memory::mapping::Mapping;
 use crate::memory::page_table::PageTableWalker;
 use crate::memory::tracker::RangeTracker;
@@ -339,6 +340,9 @@ pub struct LocalTask<P: Platform> {
     /// refusal), under the task's lock: what an unmap tests its range against. The placement
     /// list of a local task is always empty.
     object_list_range: Mutex<(u64, u32)>,
+    /// The mappings its transfer buffers were made over, kept for the next buffer over the same
+    /// pages (the map setup's), until its teardown.
+    kept: Arc<KeptMappings<P>>,
 }
 
 impl<P: Platform> LocalTask<P> {
@@ -422,6 +426,7 @@ impl<P: Platform> LocalTask<P> {
     /// Tears the task down.
     pub fn teardown(&self) {
         self.on_platform(|| self.base.teardown());
+        self.kept.clear();
     }
 
     /// Deletes the object a serialized delete names.

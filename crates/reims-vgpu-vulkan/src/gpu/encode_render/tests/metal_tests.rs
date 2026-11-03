@@ -4753,6 +4753,7 @@ fn resolved_into<P: Platform<Surface = MetalSurface>>(
         let base = s.base_address().as_ptr::<u8>();
         // SAFETY: the surface's first `n` bytes, locked, which no texture uses yet.
         unsafe { std::ptr::copy_nonoverlapping(prefill.as_ptr(), base, n) };
+        s.cpu_wrote();
         assert!(s.unlock(0).is_success());
         s
     });

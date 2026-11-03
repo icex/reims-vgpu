@@ -6,6 +6,8 @@
 //!   mappings it makes (`mach_vm_remap` of each piece into a fresh or given region).
 //! - [`mapping`]: [`Mapping`](mapping::Mapping), a host range over guest memory, and its four
 //!   teardowns.
+//! - [`kept`]: [`KeptMappings`](kept::KeptMappings), the mappings a task's transfer buffers
+//!   were made over, kept for the next buffer over the same pages where the platform lets it.
 //! - [`page_table`]: [`PageTableWalker`](page_table::PageTableWalker), a task's 1-3 level page
 //!   table walked at use time.
 //! - [`tracker`]: [`RangeTracker`](tracker::RangeTracker), which task pages the host has mapped,
@@ -48,6 +50,7 @@
 
 pub mod cursor;
 pub mod descriptor;
+pub mod kept;
 pub mod map;
 pub mod mapping;
 pub mod page_table;

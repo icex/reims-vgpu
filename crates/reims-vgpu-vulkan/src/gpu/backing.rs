@@ -550,7 +550,8 @@ static DETACHED: Mutex<Detached> = Mutex::new(Detached {
     next: 0,
     detached: BTreeSet::new(),
     released: BTreeMap::new(),
-    open: BTreeMap::new(),
+    open: BTreeSet::new(),
+    making: BTreeMap::new(),
     submitted: BTreeMap::new(),
 });
 
@@ -570,11 +571,13 @@ struct Detached {
     /// The objects released detached: the number of the release. A command buffer made before
     /// it may hold a use of the object.
     released: BTreeMap<rt::ObjectId, u64>,
-    /// The numbers of the open command buffers ([`Opened`]), each with the isolated task that
-    /// made it, if one did, until it commits. An ended task's never commits, and one of a task
-    /// that died is never released ([`TaskLife`]), so it holds nothing; a committed one closes
-    /// once it completed, whatever its task does.
-    open: BTreeMap<u64, Option<Weak<TaskLife>>>,
+    /// The numbers of the open command buffers ([`Opened`]).
+    open: BTreeSet<u64>,
+    /// The open command buffers an isolated task made, with the task, until they commit. An
+    /// ended task's never commits, and one of a task that died is never released
+    /// ([`TaskLife`]), so it holds nothing; a committed one closes once it completed, whatever
+    /// its task does.
+    making: BTreeMap<u64, Weak<TaskLife>>,
     /// The open command buffers a submission of which the runtime submitted, by number: what
     /// [`in_flight`] asks what they took.
     submitted: BTreeMap<u64, Submitted>,
@@ -595,6 +598,14 @@ impl Detached {
         let number = self.next;
         self.next += 1;
         number
+    }
+
+    /// Command buffer `made` opened, by `task` where an isolated task made it.
+    fn opened(&mut self, made: u64, task: Option<Weak<TaskLife>>) {
+        self.open.insert(made);
+        if let Some(task) = task {
+            self.making.insert(made, task);
+        }
     }
 
     /// Object `id` detached.
@@ -648,11 +659,16 @@ impl Detached {
     /// of without the lock: it holds the command buffer.
     fn closed(&mut self, made: u64) -> Option<Submitted> {
         self.open.remove(&made);
-        self.open.retain(|_, task| {
-            task.as_ref()
-                .is_none_or(|task| task.upgrade().is_some_and(|task| !task.has_ended()))
+        self.making.remove(&made);
+        let open = &mut self.open;
+        self.making.retain(|made, task| {
+            let going = task.upgrade().is_some_and(|task| !task.has_ended());
+            if !going {
+                open.remove(made);
+            }
+            going
         });
-        match self.open.keys().next() {
+        match self.open.iter().next() {
             Some(&oldest) => self.released.retain(|_, &mut at| at > oldest),
             None => self.released.clear(),
         }
@@ -672,15 +688,13 @@ impl Opened {
         let task = TaskLife::current().map(|task| Arc::downgrade(&task));
         let mut detached = DETACHED.lock();
         let made = detached.number();
-        detached.open.insert(made, task);
+        detached.opened(made, task);
         Opened(made)
     }
 
     /// The command buffer commits now: open until it completed, whatever its task does.
     pub(crate) fn commit(self) -> Opened {
-        if let Some(task) = DETACHED.lock().open.get_mut(&self.0) {
-            *task = None;
-        }
+        DETACHED.lock().making.remove(&self.0);
         self
     }
 }
@@ -899,6 +913,10 @@ pub(crate) enum ImportSite {
     Replace,
     /// A buffer over a surface, imported at its base address.
     SurfaceBase,
+    /// The platform's own buffer over a surface's base address, its base anchor
+    /// (`crate::os::wants_base_anchor`), which lies in the import of the buffer over it made just
+    /// before.
+    SurfaceAnchor,
 }
 
 impl ImportSite {
@@ -911,6 +929,7 @@ impl ImportSite {
             Self::Heap => 4,
             Self::Replace => 5,
             Self::SurfaceBase => 6,
+            Self::SurfaceAnchor => 7,
         }
     }
 }
@@ -920,6 +939,13 @@ impl ImportSite {
 /// length, the first byte imported), and `impfree` as its keep-alive goes, once the runtime
 /// freed the import (the first byte imported). A diagnostic: it holds nothing and reads nothing
 /// with an effect, and the keep-alive drops it last.
+///
+/// So `imp` counts buffers made, and `impfree` keep-alives dropped, not the runtime's imports: a
+/// buffer over the bytes a live one was made over lies in that one's import, and its keep-alive
+/// goes at its release, where the import keeps another's. After a surface's base anchor (site 7),
+/// a site-6 `imp` at its first byte is a buffer that joined its import, not new memory; the
+/// runtime's counts (`dma_buf_imports`, `host_imports_live`, in the trace's `wc2` and `wc3`) count
+/// the imports.
 pub(crate) struct ImportTrace(u64);
 
 impl ImportTrace {
@@ -1532,7 +1558,8 @@ mod tests {
             next: 0,
             detached: BTreeSet::new(),
             released: BTreeMap::new(),
-            open: BTreeMap::new(),
+            open: BTreeSet::new(),
+            making: BTreeMap::new(),
             submitted: BTreeMap::new(),
         }
     }
@@ -1540,13 +1567,13 @@ mod tests {
     /// A command buffer made now in `d` by `task`, or by none: its number.
     fn made(d: &mut Detached, task: Option<&Arc<TaskLife>>) -> u64 {
         let made = d.number();
-        d.open.insert(made, task.map(Arc::downgrade));
+        d.opened(made, task.map(Arc::downgrade));
         made
     }
 
     /// Command buffer `made` committed now in `d`.
     fn committed(d: &mut Detached, made: u64) -> u64 {
-        d.open.insert(made, None);
+        d.making.remove(&made);
         made
     }
 
@@ -1828,6 +1855,29 @@ mod tests {
         assert!(stdout.contains("status 5 code 8"), "{stdout}");
     }
 
+    /// The open command buffers: one an isolated task made and never committed is let go once
+    /// the task ended, at the next close; one it committed, and one no task made, stay open
+    /// until they close themselves
+    #[test]
+    fn an_ended_tasks_uncommitted_command_buffer_closes_at_the_next_close() {
+        let mut d = registry();
+        let task = TaskLife::new();
+        let leaked = made(&mut d, Some(&task));
+        let sent = made(&mut d, Some(&task));
+        let sent = committed(&mut d, sent);
+        let host = made(&mut d, None);
+        let other = made(&mut d, None);
+        d.closed(other);
+        let open = |d: &Detached| d.open.iter().copied().collect::<Vec<_>>();
+        assert_eq!(open(&d), [leaked, sent, host], "the task is running");
+        assert!(task.exit());
+        assert!(d.closed(host).is_none());
+        assert_eq!(open(&d), [sent]);
+        assert!(d.making.is_empty());
+        d.closed(sent);
+        assert!(d.open.is_empty());
+    }
+
     /// A command buffer of an isolated task that ended holds no release: one that died mid-encode
     /// is never released, and never commits. One that committed holds it until it completed
     #[test]
@@ -1847,9 +1897,10 @@ mod tests {
         let other = made(&mut d, None);
         assert!(task.exit());
         d.closed(other);
-        assert_eq!(d.open.keys().copied().collect::<Vec<_>>(), [sent]);
+        assert_eq!(d.open.iter().copied().collect::<Vec<_>>(), [sent]);
+        assert!(d.making.is_empty());
         assert!(d.fails(buffer, sent), "committed");
         d.closed(sent);
-        assert!(d.open.is_empty() && d.released.is_empty());
+        assert!(d.open.is_empty() && d.making.is_empty() && d.released.is_empty());
     }
 }

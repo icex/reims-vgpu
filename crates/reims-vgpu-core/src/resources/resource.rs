@@ -323,6 +323,41 @@ impl<P: Platform> Resource<P> {
         class_of(&self.kind)
     }
 
+    /// Whether its last release reaches the platform's objects and the library's own memory
+    /// alone, never the host: the kinds whose drop releases Metal objects (buffers, heaps, ICBs,
+    /// a paged texture of guest pages and its plane views and kernels), and with them their
+    /// transfer buffers, whose deallocators release a memory map's mapping (its VM's
+    /// deallocation) or nothing (the host task's memory, in the blocks setup), or keep one for
+    /// good. Not the kinds whose drop hands an IOSurface back to the task, holds one or another
+    /// resource that may (a backing, a mapper's buffer or texture, a texture over a backing, a
+    /// shared texture, a shared-layout texture), or a view whose base's texture may lie on one.
+    /// A delete lets the others go under the task's lock, between the commands of other FIFOs,
+    /// and these after it ([`crate::tasks::shared`]).
+    pub fn releases_internally(&self) -> bool {
+        use crate::resources::texture::TextureLayout;
+        match &self.kind {
+            ResourceKind::SharedBuffer(_)
+            | ResourceKind::PrivateBuffer(_)
+            | ResourceKind::DetachBuffer(_)
+            | ResourceKind::HeapBuffer(_)
+            | ResourceKind::LegacyHeap(_)
+            | ResourceKind::DetachHeap(_)
+            | ResourceKind::Icb(_) => true,
+            ResourceKind::Texture(t) => matches!(
+                t.layout,
+                TextureLayout::SinglePlane(_)
+                    | TextureLayout::DualPlaneBlit(_)
+                    | TextureLayout::DualPlaneCompute(_)
+            ),
+            ResourceKind::SerializerTexture(_)
+            | ResourceKind::RefTexture(_)
+            | ResourceKind::MapperRefBuffer(_)
+            | ResourceKind::MapperRefTexture(_)
+            | ResourceKind::SharedTexture(_)
+            | ResourceKind::Backing(_) => false,
+        }
+    }
+
     /// Whether the guest's copy is current (the kind's answer).
     pub fn is_guest_valid(&self) -> bool {
         self.class().is_guest_valid(self)

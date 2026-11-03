@@ -2483,6 +2483,12 @@ impl VulkanRenderEncoder {
     ) -> RaiseResult<()> {
         self.pipelined(sel);
         crate::gpu::timing::count_draw();
+        if reims_vgpu_core::trace::on() {
+            reims_vgpu_core::trace::event(
+                "gpdraw",
+                &[self.encoder.pipeline.load(Ordering::Relaxed)],
+            );
+        }
         match drawn {
             Some((shape, k)) => {
                 self.bfloat_drawn(sel);

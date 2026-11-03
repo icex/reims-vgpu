@@ -84,6 +84,8 @@ thread_local! {
 pub struct Held {
     /// Oldest first.
     values: RefCell<Vec<Value>>,
+    /// The keys of the values [`Held::keep_once`] holds here, which stay until the holder's end.
+    once: RefCell<Vec<usize>>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -92,6 +94,7 @@ impl Held {
     pub fn new() -> Held {
         Held {
             values: RefCell::new(Vec::new()),
+            once: RefCell::new(Vec::new()),
             _not_send: PhantomData,
         }
     }
@@ -99,6 +102,23 @@ impl Held {
     /// Holds `v` to this holder's drop.
     pub fn keep<T: Any + Send>(&self, v: T) {
         self.take(Value::new(v));
+    }
+
+    /// Holds what `make` answers to this holder's drop, as [`Held::keep`], unless the holder
+    /// already holds a value of `key` that this made: then `make` does not run. Whether one is
+    /// held: `false` where `make` answers none. A value held here stays until the holder's end,
+    /// so a key stays the identity of what it held: a reference's address, while the reference
+    /// keeps its object.
+    pub fn keep_once<T: Any + Send>(&self, key: usize, make: impl FnOnce() -> Option<T>) -> bool {
+        if self.once.borrow().contains(&key) {
+            return true;
+        }
+        let Some(v) = make() else {
+            return false;
+        };
+        self.keep(v);
+        self.once.borrow_mut().push(key);
+        true
     }
 
     /// Holds `v`, already held elsewhere, at the point it was first held.
@@ -120,6 +140,7 @@ impl Held {
             }
             Err(mut r) => {
                 let values = std::mem::take(&mut *held.values.borrow_mut());
+                held.once.borrow_mut().clear();
                 r.deferred_mut().carry(values);
                 Err(r)
             }
@@ -214,6 +235,15 @@ impl<'u> Hold<'u> {
         match self.held {
             Some(h) => h.keep(v),
             None => keep_last_resort(v),
+        }
+    }
+
+    /// A deep hold of what `make` answers, once per `key` in this holder ([`Held::keep_once`]);
+    /// with none, at every call, to the thread's last-resort holder. Whether one is held.
+    pub fn keep_once<T: Any + Send>(self, key: usize, make: impl FnOnce() -> Option<T>) -> bool {
+        match self.held {
+            Some(h) => h.keep_once(key, make),
+            None => make().map(keep_last_resort).is_some(),
         }
     }
 }
@@ -362,6 +392,37 @@ mod tests {
             seen = events();
         });
         seen
+    }
+
+    /// A value kept once per key is made and held at the key's first keep alone, and released
+    /// at the holder's end in its place; one `make` answers none of is not held, and its key
+    /// stays free. A landing frame that raises carries its values and frees its keys
+    #[test]
+    fn a_value_kept_once_is_held_at_its_first_keep() {
+        let seen = releases(|| {
+            let held = Held::new();
+            let hold = Hold::of(&held);
+            assert!(!hold.keep_once(1, || None::<Rel>));
+            assert!(hold.keep_once(1, || Some(Rel("a"))));
+            held.keep(Rel("b"));
+            assert!(hold.keep_once(1, || -> Option<Rel> { panic!("made again") }));
+            assert!(hold.keep_once(2, || Some(Rel("c"))));
+            note("body");
+            drop(held);
+        });
+        assert_eq!(seen, ["body", "release c", "release b", "release a"]);
+        let seen = releases(|| {
+            let raised = Held::raising(|held| -> RaiseResult<()> {
+                assert!(Hold::of(held).keep_once(1, || Some(Rel("d"))));
+                let r: RaiseResult<()> = Err(a_raise());
+                r.inspect_err(|_| assert!(held.once.borrow().contains(&1)))
+            });
+            note("raised");
+            let held = Held::new();
+            Hold::of(&held).land(raised.unwrap_err());
+            drop(held);
+        });
+        assert_eq!(seen, ["raised", "release d"]);
     }
 
     /// A holder releases what it keeps at its drop, most recent first

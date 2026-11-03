@@ -491,6 +491,7 @@ impl<P: Platform> Display<P> {
             if !encoded {
                 return Err(Error::InvalidArgument);
             }
+            target.encode_pixels(&command_buffer);
             Ok(Frame::new(command_buffer, target.clone_ref()))
         })
     }

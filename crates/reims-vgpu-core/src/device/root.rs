@@ -41,6 +41,7 @@ use crate::fifo::Fifo;
 use crate::guest::GuestPtr;
 use crate::guest::records::{APV_PAGE_MASK, APV_PAGE_SHIFT, APV_PAGE_SIZE};
 use crate::host::{HostPtr, PhysRange};
+use crate::memory::map::MemoryMap;
 use crate::memory::mapping::{Mapping, Teardown};
 use crate::num::{ToU64, ToUsize, Truncate};
 use crate::platform::Platform;
@@ -476,6 +477,20 @@ impl<P: Platform> DeviceCore<P> {
         address: u64,
         dst: &mut [u8],
     ) -> RaiseResult<bool> {
+        let map = self.memory_map.lock().clone();
+        self.read_from_physical_address_through(map.as_deref(), on, address, dst)
+    }
+
+    /// [`DeviceCore::read_from_physical_address`] through `map`, the device's memory map as the
+    /// caller read it ([`DeviceCore::memory_map`]): a copy of several pages reads it once. The
+    /// map stays the device's while the device lives.
+    pub fn read_from_physical_address_through(
+        &self,
+        map: Option<&MemoryMap<P>>,
+        on: OnFault,
+        address: u64,
+        dst: &mut [u8],
+    ) -> RaiseResult<bool> {
         let length = dst.len().low_u32();
         if u64::from(length) > PHYSICAL_READ_PAGE
             || (address & PHYSICAL_PAGE_MASK).wrapping_add(u64::from(length)) > PHYSICAL_READ_PAGE
@@ -484,7 +499,6 @@ impl<P: Platform> DeviceCore<P> {
                 format_args!("read of {length:#x} bytes at {address:#x} runs past its page")
             );
         }
-        let map = self.memory_map.lock().clone();
         if let Some(map) = map {
             return Ok(map.read(address, dst));
         }

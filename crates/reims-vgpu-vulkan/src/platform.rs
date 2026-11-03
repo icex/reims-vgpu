@@ -286,7 +286,9 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
 /// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), each
 /// announced at every occurrence (`announce_each`, [`crate::answer::DIES`]), as are those a
-/// creator learns of ([`crate::answer::HEARD`]). One set,
+/// creator learns of ([`crate::answer::HEARD`]). With the trace on (`REIMS_VGPU_TRACE`, its file
+/// open), each texture over a buffer's storage is logged to it (`log_texture_storage`), a
+/// diagnostic that changes no storage. One set,
 /// so the runtime keeps one device per physical device across `open_device` and every other open.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
@@ -304,7 +306,10 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         let mut options = rt::DeviceOptions::default();
         crate::os::add_window_extensions(&mut options);
         options.metal_level = crate::os::METAL_LEVEL;
-        options.gpu_times_from_host = true;
+        // `REIMS_VGPU_GPU_TIMESTAMPS=1` has command buffers write real GPU timestamps, a
+        // diagnostic for the timing lines and the trace: neither the guest nor the host sees them.
+        options.gpu_times_from_host =
+            std::env::var_os("REIMS_VGPU_GPU_TIMESTAMPS").is_none_or(|v| v != "1");
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());
         options.messages = Some(rt::MessageSink::new(crate::answer::notice));
         options.announce_each = crate::answer::DIES
@@ -313,6 +318,10 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
             .collect();
         if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
             reims_vgpu_core::trace::set_clock(crate::gpu::timing::trace_clock);
+            // Each texture over a buffer's storage choice and its times reach the sink, which
+            // writes them to the trace alone (`tstor`, `crate::answer::notice`): only where the
+            // trace's file opened. The same storage is made either way.
+            options.log_texture_storage = reims_vgpu_core::trace::on();
             if crate::answer::trace_degradations() && reims_vgpu_core::trace::on() {
                 // Every occurrence reaches the sink, which writes each to the trace and relays
                 // a kind the runtime announces once only the first time: only where the trace's

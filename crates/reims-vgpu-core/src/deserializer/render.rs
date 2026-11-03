@@ -239,12 +239,15 @@ impl<P: Platform> RenderDecoder<P> {
         segment: &mut Cursor,
     ) -> RaiseResult<()> {
         if header.continues_previous == 0 {
+            let open = crate::trace::span_start();
             let descriptor = self.pass_prefix(hold, segment)?;
             let encoder = match &self.command_buffer {
                 Some(buffer) => buffer.render_encoder(OnFault::Return, &descriptor)?,
                 None => None,
             };
             drop(descriptor);
+            // 55: the pass opened
+            crate::trace::span(55, open, &[]);
             // A carried decoder's open encoder is replaced without being released: it is kept for
             // good, with its command buffer and what that holds.
             if let Some(open) = self.encoder.take() {
@@ -255,11 +258,22 @@ impl<P: Platform> RenderDecoder<P> {
         if self.encoder.is_none() {
             crate::raise!(RaiseKind::NoEncoder, "no render encoder");
         }
+        let records = crate::trace::span_start();
+        let (mut count, mut draws) = (0u64, 0u64);
         while let Some((record_header, mut record)) = next_record(segment)? {
+            if records.is_some() {
+                count = count.wrapping_add(1);
+                draws = draws.wrapping_add(u64::from(is_draw(record_header.command_id)));
+            }
             self.dispatch(hold, record_header.command_id, &mut record)?;
         }
+        // 56: the segment's records: their count, the draws among them
+        crate::trace::span(56, records, &[count, draws]);
         if header.continued_by_next == 0 {
+            let end = crate::trace::span_start();
             self.send(RenderCmd::EndEncoding)?;
+            // 57: the pass's end
+            crate::trace::span(57, end, &[]);
             self.pipeline = None;
         }
         Ok(())
@@ -428,6 +442,12 @@ impl<P: Platform> RenderDecoder<P> {
             .object_delegate()
             .get_sampler_state(hold, reference)
     }
+}
+
+/// Whether the render record `command_id` draws ([`RenderDecoder`]'s dispatch): the draws of
+/// 0x0-0x13 and 0x1c-0x1d, for the trace's counts.
+fn is_draw(command_id: u32) -> bool {
+    matches!(command_id, 0x0..=0x13 | 0x1c | 0x1d)
 }
 
 /// `Option<X>` elements as the `Option<&X>` slice a list send takes.

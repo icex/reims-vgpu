@@ -80,6 +80,10 @@ thread_local! {
     /// runs a task's code never touches `TRAP`, whose value has a destructor to register: a host
     /// thread, a Metal thread, or one already destroying its thread-locals.
     static IN_TASK: Cell<bool> = const { Cell::new(false) };
+
+    /// `TRAP` holds a task in [`Mode::Working`]: what [`stop_if_task_ended`] reads first.
+    static WORKING: Cell<bool> = const { Cell::new(false) };
+
 }
 
 /// Wakes one thread that waits on the host for the task ([`TaskLife::waiting`]).
@@ -219,12 +223,14 @@ impl TaskLife {
         }
         let outer = TRAP.with(|t| t.replace(Some((Arc::clone(self), mode))));
         let in_task = IN_TASK.replace(true);
+        let working = WORKING.replace(mode == Mode::Working);
         let leaks = LEAKS.get();
         LEAKS.set(mode == Mode::Releasing && self.death().is_some());
         let r = catch_unwind(AssertUnwindSafe(f));
         LEAKS.set(leaks);
         TRAP.with(|t| *t.borrow_mut() = outer);
         IN_TASK.set(in_task);
+        WORKING.set(working);
         match r {
             Ok(v) => Some(v),
             Err(p) if p.is::<Stopped>() => {
@@ -343,11 +349,20 @@ pub fn leaks_objects() -> bool {
 
 /// Stops this thread here when it runs the work of an isolated task that has ended
 /// ([`TaskLife::stop_if_ended`]); anywhere else, nothing. Called before every step with an
-/// effect: each Metal call, each write to guest memory.
+/// effect: each Metal call, each write to guest memory. Read the task's end at every step: a
+/// separate counter updated after it cannot stand in for that store when the ending thread is
+/// descheduled between them.
+#[inline]
 pub fn stop_if_task_ended() {
-    if !IN_TASK.get() {
+    if !WORKING.get() {
         return;
     }
+    stop_if_ended_task_read();
+}
+
+/// [`stop_if_task_ended`] while working: the thread's task, read.
+#[inline]
+fn stop_if_ended_task_read() {
     let ended = TRAP.with(|t| match &*t.borrow() {
         Some((life, Mode::Working)) if life.has_ended() => Some(Arc::clone(life)),
         _ => None,
@@ -571,6 +586,52 @@ mod tests {
             let _ = p.world().script.next(crate::platform::ObjId(0), "commit");
         });
         assert_eq!(r, None);
+    }
+
+    /// Another task's end leaves this task going on; its own end, on another thread, stops it
+    /// at its next step. A nested task's end leaves the outer one going on.
+    #[test]
+    fn a_task_found_going_on_is_read_again_at_an_end() {
+        let life = TaskLife::new();
+        let (other, inner) = (TaskLife::new(), TaskLife::new());
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let s2 = steps.clone();
+        let l2 = Arc::clone(&life);
+        let r = life.run(|| {
+            stop_if_task_ended();
+            stop_if_task_ended();
+            assert!(other.exit());
+            stop_if_task_ended();
+            assert_eq!(inner.run(|| assert!(inner.exit())), Some(()));
+            stop_if_task_ended();
+            s2.lock().push("going on");
+            std::thread::spawn(move || assert!(l2.exit()))
+                .join()
+                .unwrap();
+            stop_if_task_ended();
+            s2.lock().push("never");
+        });
+        assert_eq!(r, None);
+        assert_eq!(*steps.lock(), vec!["going on"]);
+    }
+
+    /// An end is visible to `has_ended` before the ending thread reaches any later work. A
+    /// worker must stop its next effect even if that thread is descheduled just after the store.
+    #[test]
+    fn a_published_end_stops_the_next_effect() {
+        let life = TaskLife::new();
+        let effect = AtomicBool::new(false);
+        let result = life.run(|| {
+            stop_if_task_ended();
+            // The first part of `exit`, before the ending thread unlocks or wakes waiters.
+            *life.state.lock() = State::Exited;
+            life.ended.store(true, Ordering::SeqCst);
+            assert!(life.has_ended());
+            stop_if_task_ended();
+            effect.store(true, Ordering::SeqCst);
+        });
+        assert_eq!(result, None);
+        assert!(!effect.load(Ordering::SeqCst));
     }
 
     /// A thread waiting on the host is woken once when the task ends, by a death or by the

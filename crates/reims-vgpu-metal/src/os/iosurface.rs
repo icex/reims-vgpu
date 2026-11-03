@@ -237,6 +237,9 @@ impl reims_vgpu_core::platform::os::surface::Surface for MetalSurface {
         HostPtr::from_ptr(unsafe { IOSurfaceGetBaseAddress(self.as_iosurface_ref()) })
     }
 
+    /// Nothing: Metal's textures over the surface are its memory.
+    fn cpu_wrote(&self) {}
+
     fn alloc_size(&self) -> u64 {
         // SAFETY: a live IOSurfaceRef.
         (unsafe { IOSurfaceGetAllocSize(self.as_iosurface_ref()) }).to_u64()

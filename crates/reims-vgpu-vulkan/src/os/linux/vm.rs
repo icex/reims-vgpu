@@ -45,9 +45,10 @@ use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 
 use super::budget;
 use super::files::{self, Backing};
+use super::vram;
 
 /// `KERN_INVALID_ADDRESS`.
-const INVALID_ADDRESS: KernReturn = KernReturn(1);
+pub(super) const INVALID_ADDRESS: KernReturn = KernReturn(1);
 /// `KERN_PROTECTION_FAILURE`.
 const PROTECTION_FAILURE: KernReturn = KernReturn(2);
 /// `KERN_NO_SPACE`.
@@ -57,11 +58,14 @@ const INVALID_ARGUMENT: KernReturn = KernReturn(4);
 /// `KERN_FAILURE`.
 const FAILURE: KernReturn = KernReturn(5);
 
-/// The host's page size.
+/// The host's page size, read once per process: it is the kernel's, fixed for its boot.
 pub(super) fn page_size() -> u64 {
-    // SAFETY: a sysconf query, which cannot fail for this name.
-    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u64::try_from(size).unwrap_or(4096)
+    static SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        // SAFETY: a sysconf query, which cannot fail for this name.
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        u64::try_from(size).unwrap_or(4096)
+    });
+    *SIZE
 }
 
 /// The whole pages `len` bytes at `addr` lie in: the first byte of the first, and their length;
@@ -216,14 +220,22 @@ pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
     Ok(HostAddr::from_addr(at.to_usize()))
 }
 
+/// What the budget's death names for a stand-in's memory ([`budget::admit`]).
+const OWN_MEMORY: &str = "an IOSurface stand-in's memory";
+
 /// Memory of the library's own that a view can be made of and that only its holder frees: a
-/// shared mapping of a new file, read and write, registered in the backing table
-/// ([`files::Registration`]), so that `deallocate` refuses it. An IOSurface stand-in's memory.
+/// shared mapping of a file it is given, read and write, registered in the backing table
+/// ([`files::Registration`]), so that `deallocate` refuses it. An IOSurface stand-in's memory:
+/// a new sealed memfd ([`OwnMemory::new`]), or, under `REIMS_VGPU_VRAM_SURFACES`, a dma-buf of
+/// device memory ([`OwnMemory::in_vram`]), which takes no seals and whose mapping is
+/// write-combined and of no pages the kernel lists (`VM_PFNMAP`).
 #[derive(Debug)]
 pub(crate) struct OwnMemory {
     first: u64,
     length: u64,
     registration: Option<files::Registration>,
+    /// The dma-buf of device memory it maps, listed while the mapping lives ([`vram::Listed`]).
+    vram: Option<vram::Listed>,
 }
 
 impl OwnMemory {
@@ -234,17 +246,37 @@ impl OwnMemory {
         if length == 0 {
             return None;
         }
-        budget::admit(1, "an IOSurface stand-in's memory");
-        let backing = Backing {
-            fd: memfd(length),
-            offset: 0,
-        };
-        let first = file(None, length, &backing, libc::PROT_READ | libc::PROT_WRITE).ok()?;
+        budget::admit(1, OWN_MEMORY);
+        OwnMemory::over(memfd(length), length).ok()
+    }
+
+    /// `len` bytes, rounded up to whole pages, of zeros in a new dma-buf of `exporter`'s device
+    /// memory ([`vram::export`]); refused, nothing held, where it makes none or the kernel maps
+    /// none of it.
+    pub(crate) fn in_vram(len: u64, exporter: &vram::Exporter) -> Result<OwnMemory, vram::Refused> {
+        let length = pages(HostAddr::NULL, len)
+            .map(|(_, length)| length)
+            .filter(|&length| length > 0)
+            .ok_or(vram::Refused::Map(INVALID_ARGUMENT))?;
+        budget::admit(1, OWN_MEMORY);
+        let listed = vram::export(exporter, length)?;
+        let mut own = OwnMemory::over(listed.fd(), length).map_err(vram::Refused::Map)?;
+        own.vram = Some(listed);
+        Ok(own)
+    }
+
+    /// The first `length` bytes, whole pages, of `fd`, a file of the library's own, mapped shared,
+    /// read and write, and registered, its mapping counted in the budget, which the caller has
+    /// admitted it to ([`budget::admit`]); the `errno`'s answer where the kernel maps none.
+    fn over(fd: Arc<OwnedFd>, length: u64) -> Result<OwnMemory, KernReturn> {
+        let backing = Backing { fd, offset: 0 };
+        let first = file(None, length, &backing, libc::PROT_READ | libc::PROT_WRITE)?;
         budget::own_hold(1, true);
-        Some(OwnMemory {
+        Ok(OwnMemory {
             first,
             length,
             registration: Some(files::Registration::new(first, length, backing)),
+            vram: None,
         })
     }
 
@@ -255,12 +287,14 @@ impl OwnMemory {
 }
 
 impl Drop for OwnMemory {
-    /// Drops the registration, then the mapping.
+    /// Drops the registration, then the mapping, then the dma-buf's listing, so no import of its
+    /// pages is answered from the list once they are unmapped.
     fn drop(&mut self) {
         drop(self.registration.take());
         // SAFETY: the mapping this made, which nothing uses once its holder lets go of it.
         let _ = unsafe { libc::munmap(ptr(self.first), self.length.to_usize()) };
         budget::own_hold(1, false);
+        drop(self.vram.take());
     }
 }
 
