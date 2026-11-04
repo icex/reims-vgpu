@@ -164,5 +164,51 @@ class Backend(unittest.TestCase):
             self.assertEqual(fake.writes, [])
         finally: worker.close()
 
+class DesktopOwner(unittest.TestCase):
+    def test_wayland_never_instantiates_gtk_clipboard_request_handlers(self):
+        try:
+            spec = importlib.util.spec_from_file_location('controls', Path(__file__).with_name('desktop-controls.py'))
+            controls = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(controls)
+        except ImportError:
+            self.skipTest('GTK/SPICE introspection unavailable')
+        class MainChannel(Channel):
+            def __init__(self):
+                super().__init__()
+                self.request_handlers = []
+            def request_from_guest(self, selection, kind):
+                return [handler(self, selection, kind) for handler in self.request_handlers]
+        class GtkOwner:
+            def __init__(self): self.properties = {}
+            def set_property(self, name, value): self.properties[name] = value
+        class GtkFactory:
+            calls = 0
+            @classmethod
+            def get(cls, channel):
+                cls.calls += 1
+                # spice-gtk0.42 attaches this handler when GtkSession is
+                # constructed, even with auto-clipboard=False. Its private
+                # clip_grabbed wasn't set by our manual MainChannel grab.
+                def gtk_request(*_):
+                    raise AssertionError('GTK clip_grabbed is false')
+                channel.request_handlers.append(gtk_request)
+                return GtkOwner()
+        fake = type('GtkModule', (), {'GtkSession': GtkFactory})
+        channel = MainChannel()
+        with mock.patch.object(controls, 'SpiceClientGtk', fake):
+            self.assertIsNone(controls.gtk_clipboard_owner(channel, True, True))
+            self.assertEqual(GtkFactory.calls, 0)
+            bridge = clip.Clipboard(channel, lambda *a: None)
+            bridge.set_enabled(True);bridge.set_connected(True)
+            bridge.host_changed(b'baseline');bridge.host_changed(b'new copy')
+            channel.request_handlers.append(bridge.requested)
+            self.assertEqual(channel.request_from_guest(0, 1), [True])
+            self.assertEqual(channel.calls[-1], ('notify', (0, 1, list(b'new copy'))))
+            # The X11 path deliberately retains GtkSession ownership.
+            x11 = MainChannel()
+            owner = controls.gtk_clipboard_owner(x11, False, False)
+            self.assertEqual(GtkFactory.calls, 1)
+            self.assertEqual(owner.properties, {'auto-clipboard': False, 'auto-usbredir': False})
+
 
 if __name__ == '__main__': unittest.main()

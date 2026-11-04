@@ -17,6 +17,18 @@ gi.require_version('SpiceClientGtk', '3.0')
 from gi.repository import Gtk, GLib, GObject, SpiceClientGLib, SpiceClientGtk
 
 
+def gtk_clipboard_owner(session, enabled, wayland):
+    # GtkSession installs request handlers even when auto-clipboard is false.
+    # Those handlers assume GTK owns every host grab, so a data-control client
+    # must not construct GtkSession at all. MainChannel alone needs no GTK owner.
+    if wayland:
+        return None
+    clipboard = SpiceClientGtk.GtkSession.get(session)
+    clipboard.set_property('auto-clipboard', enabled)
+    clipboard.set_property('auto-usbredir', False)
+    return clipboard
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', type=Path)
@@ -29,15 +41,13 @@ def main():
     session.set_property('unix-path', str(run / 'spice.sock'))
     for name in ('enable-audio', 'enable-usbredir', 'enable-smartcard'):
         session.set_property(name, False)
-    clipboard = SpiceClientGtk.GtkSession.get(session)
     wayland = bool(os.environ.get('WAYLAND_DISPLAY'))
     try:
         settings = json.loads(Path(__file__).with_name('desktop-settings.json').read_text())
     except (OSError, ValueError):
         settings = {}
     enabled = settings.get('clipboard', True) is not False and os.environ.get('REIMS_CLIPBOARD', '1') != '0'
-    # GtkSession's focus-dependent clipboard and data-control must never both own it.
-    clipboard.set_property('auto-clipboard', enabled and not wayland)
+    clipboard = gtk_clipboard_owner(session, enabled, wayland)
     bridge = worker = None
     bridge_timer = None
     bridge_module = None
@@ -49,7 +59,6 @@ def main():
             spec = importlib.util.spec_from_file_location('reims_wayland_clipboard', Path(__file__).with_name('wayland-clipboard.py'))
             bridge_module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(bridge_module)
-    clipboard.set_property('auto-usbredir', False)
     window = Gtk.Window(title='Reims — desktop controls')
     window.set_default_size(380, 160)
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -62,7 +71,8 @@ def main():
         nonlocal enabled
         enabled = button.get_active()
         print('clipboard-enabled=' + str(enabled), flush=True)
-        clipboard.set_property('auto-clipboard', enabled and not wayland)
+        if clipboard is not None:
+            clipboard.set_property('auto-clipboard', enabled)
         if bridge is not None:
             bridge.set_enabled(enabled)
         if worker is not None:

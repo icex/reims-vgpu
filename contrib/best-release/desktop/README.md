@@ -25,8 +25,10 @@ QEMU exit, next-boot filesystem state and host-suspend safety separately.
 
 The optional `desktop-controls.py` connects the private SPICE text clipboard.
 On Wayland it uses installed `wl-paste`/`wl-copy` data-control access, so the
-native Reims window may retain focus. It disables GtkSession auto-clipboard on
-Wayland to keep a single clipboard owner. X11 retains GtkSession's clipboard.
+native Reims window may retain focus. It does not instantiate GtkSession on
+Wayland: auto-clipboard=False still installs GTK request handlers whose private
+clip_grabbed state does not track data-control grabs. MainChannel alone owns the
+Wayland clipboard; X11 retains GtkSession's clipboard.
 Copying an image, file selection, invalid UTF-8, NUL or more than 65536 bytes
 releases the text offer without clearing the other clipboard. An empty text
 string is distinct from releasing a selection. Only new text changes after the
