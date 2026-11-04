@@ -49,6 +49,24 @@ class ShareTests(unittest.TestCase):
             self.assertIn('vfs objects = fruit streams_xattr', config)
             self.assertIn('spotlight = no', config)
 
+    def test_active_and_pristine_disposable_disks_are_protected(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            home = Path(temp)
+            for name in ('disk', 'pristine', 'run'):
+                (home / name).mkdir()
+            for name in ('macos.qcow2', 'OpenCore.qcow2', 'OVMF_VARS.fd'):
+                for folder in ('disk', 'pristine'):
+                    (home / folder / name).write_text('protected fixture')
+            command = ['/fixture/qemu']
+            for path in (home / 'disk').iterdir():
+                command += ['-drive', 'format=raw,file=' + str(path)]
+            (home / 'run/command.json').write_text(__import__('json').dumps(command))
+            images = share.protected_images(home, home / 'run')
+            self.assertEqual(len(images), 6)
+            self.assertIn(home / 'disk/macos.qcow2', images)
+            self.assertIn(home / 'pristine/macos.qcow2', images)
+            self.assertIn('/macos.qcow2/', share.samba_config(home, []))
+
     def test_guest_credential_only_stdin_not_persistent_files(self):
         secret = 'a' * 64
         payload = share.guest_installer(secret)

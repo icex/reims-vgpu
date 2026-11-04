@@ -58,7 +58,7 @@ def private_write(path, content):
         stream.write(content.encode() if isinstance(content, str) else content)
 
 
-def protected_images(home):
+def protected_images(home, run=None):
     """Protect existing images, including their aliases through symlinks in home.
 
     Samba's veto list matches components. Exact image basenames are therefore
@@ -76,12 +76,38 @@ def protected_images(home):
                         real = path.resolve(strict=True)
                         if real.is_relative_to(Path(home).resolve()):
                             images.append(real)
+    if run is not None:
+        run = Path(run).resolve(strict=True)
+        command_file = run / 'command.json'
+        if command_file.is_file():
+            command = json.loads(command_file.read_text())
+            if not isinstance(command, list) or not all(isinstance(a, str) for a in command):
+                raise ValueError('Invalid VM command metadata')
+            for index, arg in enumerate(command[:-1]):
+                if arg != '-drive':
+                    continue
+                for part in command[index + 1].split(','):
+                    if part.startswith('file='):
+                        path = Path(part[5:]).resolve(strict=True)
+                        if not path.is_relative_to(Path(home).resolve()):
+                            raise ValueError('VM storage must be inside the exported home')
+                        if path.is_file():
+                            images.append(path)
+        # The disposable runner keeps its ONE pristine snapshot beside run logs.
+        pristine = run.parent / 'pristine'
+        if pristine.is_dir():
+            for path in pristine.iterdir():
+                if path.is_file() and (path.suffix.lower() in IMAGE_SUFFIXES or path.name == 'OVMF_VARS.fd'):
+                    path = path.resolve(strict=True)
+                    if not path.is_relative_to(Path(home).resolve()):
+                        raise ValueError('Pristine storage must be inside the exported home')
+                    images.append(path)
     return sorted(set(images))
 
 
 def samba_config(home, images, port=PORT, encryption='if_required'):
     home = Path(home).resolve()
-    names = sorted({'reims-9070xt', '.DS_Store', '._*', *(p.name for p in images)})
+    names = sorted({'reims-9070xt', 'macos.qcow2', '.DS_Store', '._*', *(p.name for p in images)})
     if any(any(c in n for c in '\n\r/%') for n in names):
         raise ValueError('Unsupported protected image basename')
     if encryption not in ('if_required', 'required'):
@@ -194,7 +220,7 @@ class HomeShare:
         password = credential.read_text().strip()
         if len(password) != 64 or any(c not in '0123456789abcdef' for c in password):
             raise RuntimeError('Invalid private home-share credential format')
-        images = protected_images(self.home)
+        images = protected_images(self.home, self.run)
         private_write(self.state / 'smb.conf', samba_config(self.home, images, self.port, encryption))
         private_write(self.state / 'start.sh', CONTAINER_SCRIPT)
         private_write(self.state / 'masked-image', b'')
@@ -218,12 +244,18 @@ class HomeShare:
         if protected.exists():
             command += ['--mount', f'type=bind,src={self.state}/masked-storage,dst={protected},readonly']
         for path in images:
+            if path.is_relative_to(protected):
+                continue  # Already covered by the empty read-only directory.
             command += ['--mount', f'type=bind,src={self.state}/masked-image,dst={path},readonly']
         command += ['--entrypoint', '/bin/sh', self.image, '/reims-config/start.sh']
+        if self.stop_event.is_set():
+            raise RuntimeError('Home-share startup was cancelled')
         self.container = self.name  # Recover an owned container even if docker run times out.
         self.container = self.docker(*command).stdout.strip()
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
+            if self.stop_event.is_set():
+                raise RuntimeError('Home-share startup was cancelled')
             status = self.docker('inspect', '--format', '{{.State.Running}}', self.container, check=False)
             if status.returncode or status.stdout.strip() != 'true':
                 raise RuntimeError('Home-share server did not stay running')
