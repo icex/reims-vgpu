@@ -470,8 +470,8 @@ chmod 700 "$support/mount.sh"
 printf %s {shlex.quote(base64.b64encode(plist).decode())} | /usr/bin/base64 -D > "$HOME/Library/LaunchAgents/org.reims.home-share.plist"
 /bin/launchctl bootout "gui/$(id -u)/org.reims.home-share" >/dev/null 2>&1 || :
 /bin/launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/org.reims.home-share.plist"
-if [ ! -e "$HOME/Desktop/Linux Home" ] && [ ! -L "$HOME/Desktop/Linux Home" ]; then
-    ln -s /Volumes/{SHARE} "$HOME/Desktop/Linux Home"
+if [ ! -e "$HOME/Linux Home" ] && [ ! -L "$HOME/Linux Home" ]; then
+    ln -s /Volumes/{SHARE} "$HOME/Linux Home"
 fi
 # The GUI LaunchAgent performs the mount and can read the login keychain.
 # Calling mount.sh directly from this SSH audit session would fail again.

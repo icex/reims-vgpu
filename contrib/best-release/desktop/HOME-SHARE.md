@@ -46,7 +46,7 @@ the chosen policy and may not be described as a desktop/GPU speedup.
 Idempotent SSH setup waits for Aqua/Finder. It archives and unloads the obsolete
 org.raphael.linux-shares LaunchAgent without deleting any of its keychain items;
 installs org.reims.home-share with15-second retry/remount checks; and adds the
-Desktop/Linux Home link to /Volumes/ReimsHome. Password retrieval and mount are
+~/Linux Home link to /Volumes/ReimsHome. Password retrieval and mount are
 inside AppleScript memory, with subprocess output suppressed.
 
 No-hardware tests: python3 -B test_home_share.py. Real guest mount/reboot/copy,
@@ -61,7 +61,7 @@ While no VM is running, set desktop-settings.json home_share=false. In macOS:
 launchctl bootout gui/$(id -u)/org.reims.home-share
 rm "$HOME/Library/LaunchAgents/org.reims.home-share.plist"
 umount /Volumes/ReimsHome
-rm "$HOME/Desktop/Linux Home"
+rm "$HOME/~/Linux Home"
 security delete-internet-password -a macosshare -s 10.0.2.2 -p ReimsHome -P 4450 -r 'smb '
 ```
 
@@ -73,3 +73,6 @@ old agent only if deliberately returning to the old Raphael shares. Remove the
 Reims support directory after inspecting those backups. The host config/state
 can be removed after all Reims-owned home-share containers are absent. No host
 package or system configuration was installed.
+
+Dropped files land in macOS Desktop and can sync to iCloud. The home-share
+shortcut stays at ~/Linux Home, outside Desktop/Documents/iCloud Drive.

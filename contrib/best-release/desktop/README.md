@@ -61,7 +61,7 @@ clipboard signals; X11 uses the GTK clipboard client.
 
 `home-share.py` starts the locally available Samba image on host loopback only
 and configures the guest's removable login agent over the private SSH forward.
-Finder's Desktop/Linux Home link opens the writable host home. Dotfiles are
+Finder's ~/Linux Home link opens the writable host home. Dotfiles are
 visible with Cmd+Shift+period. The guest can read host credentials including
 `~/.ssh`; storage vetoes and read-only masks protect the VM's disks. See
 HOME-SHARE.md for exact protection semantics and removal.
@@ -78,3 +78,6 @@ provided. Auxiliary failures leave QEMU running; their logs are in the run dir.
 The guest clipboard bootstrap packages only authored sources, builds its small
 AppKit helper inside macOS, and retires the legacy clipboard job while keeping
 its files and prior state for rollback. See guest-clipboard/README.md.
+
+Dropped files land in macOS Desktop and can sync to iCloud. The home-share
+shortcut stays at ~/Linux Home, outside Desktop/Documents/iCloud Drive.

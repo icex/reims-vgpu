@@ -99,6 +99,12 @@ class ShareTests(unittest.TestCase):
         self.assertEqual(shell.returncode, 0, shell.stderr)
         self.assertEqual(subprocess.run(['/bin/sh', '-n'], input=agent, text=True).returncode, 0)
 
+    def test_shortcut_is_outside_icloud_desktop(self):
+        payload = share.guest_installer('d' * 64)
+        self.assertIn('"$HOME/Linux Home"', payload)
+        self.assertNotIn('$HOME/Desktop', payload)
+        self.assertNotIn('$HOME/Documents', payload)
+
     def test_gui_worker_keeps_credential_in_security_stdin(self):
         namespace = {'__name__': 'keychain_fixture'}
         exec(compile(share.guest_keychain_worker(), '<fixture-worker>', 'exec'), namespace)

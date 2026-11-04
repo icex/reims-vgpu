@@ -42,10 +42,15 @@ pub const TITLE: &str = "Reims vGPU";
 /// The title of the window of the display on `port`: [`TITLE`], then " (port N)" for a port N
 /// other than 0. The display's name is not in it.
 pub fn title(port: u64) -> String {
+    title_for_copy(port, std::env::var_os("REIMS_VGPU_TEST_COPY").is_some())
+}
+
+fn title_for_copy(port: u64, test_copy: bool) -> String {
+    let title = if test_copy { "Reims TEST COPY" } else { TITLE };
     if port == 0 {
-        TITLE.to_owned()
+        title.to_owned()
     } else {
-        format!("{TITLE} (port {port})")
+        format!("{title} (port {port})")
     }
 }
 
@@ -386,6 +391,13 @@ mod tests {
     }
 
     /// "Reims vGPU", then the port when it is not 0
+    #[test]
+    fn test_copy_title_is_visibly_distinct() {
+        assert_eq!(title_for_copy(0, true), "Reims TEST COPY");
+        assert_eq!(title_for_copy(1, true), "Reims TEST COPY (port 1)");
+        assert_eq!(title_for_copy(0, false), "Reims vGPU");
+    }
+
     #[test]
     fn a_window_s_title_is_reims_vgpu_and_its_port() {
         assert_eq!(title(0), "Reims vGPU");
