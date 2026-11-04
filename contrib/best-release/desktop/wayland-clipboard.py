@@ -234,7 +234,11 @@ class Clipboard:
             return
         generation, expected, _ = self.inflight
         self.inflight = None
-        if self.active() and self.want and generation == self.generation and kind == UTF8 and 0 <= size <= LIMIT:
+        if self.active() and self.want and generation == self.generation:
+            # Refusal consumes this offer; do not request an unsupported offer forever.
+            self.want = False
+            if kind != UTF8 or not 0 <= size <= LIMIT:
+                return
             try:
                 value = ctypes.string_at(data, size) if isinstance(data, int) else bytes(data or b'')[:size]
                 text(value)

@@ -61,6 +61,7 @@ def main():
     def toggled(button):
         nonlocal enabled
         enabled = button.get_active()
+        print('clipboard-enabled=' + str(enabled), flush=True)
         clipboard.set_property('auto-clipboard', enabled and not wayland)
         if bridge is not None:
             bridge.set_enabled(enabled)
