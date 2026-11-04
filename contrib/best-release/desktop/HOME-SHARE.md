@@ -2,8 +2,8 @@
 
 The optional home-share.py companion runs for exactly one run-session.py child
 lifetime. Start it only when desktop-settings.json home_share is true (default
-true). Run it beside QEMU, never as a prerequisite for QEMU startup. Stop it on
-all session exits and allow 35 seconds for cooperative Docker cleanup. A missing
+false for older settings). Run it beside QEMU, never as a prerequisite for QEMU startup. Stop it on
+all session exits and allow 90 seconds for cooperative Docker cleanup. A missing
 Docker daemon, image, or guest SSH must only produce a log/desktop notification.
 
 CLI: home-share.py --run RUN --ssh-port PORT --ssh-key KEY --known-hosts FILE.
@@ -25,7 +25,7 @@ smb://10.0.2.2:4450/ReimsHome. All share operations run as UID/GID1000.
 The complete home is writable, including dotfiles (Finder Cmd+Shift+period).
 This gives macOS programs access to ~/.ssh and other host credentials. Protected
 storage is excluded: every component named reims-9070xt, plus exact basenames of
-existing disk images under macos-vm. Recognized image suffixes are qcow2,qcow,img,
+existing disk images under macos-vm, all active VM drive paths, and the disposable pristine snapshot drives. Files named macos.qcow2 are always vetoed. Recognized image suffixes are qcow2,qcow,img,
 raw,vmdk,vdi,dmg,iso. Samba matches components rather than relative paths, so any
 duplicate image basename elsewhere in home is also excluded. The start receipt
 lists every protected image path and excluded basename. Other macos-vm contents

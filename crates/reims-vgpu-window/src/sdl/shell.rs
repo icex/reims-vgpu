@@ -313,6 +313,8 @@ pub(crate) fn event(event: &SDL_Event) {
             event.button.windowID.0
         },
         k if k == SDL_EVENT_MOUSE_WHEEL.0 => unsafe { event.wheel.windowID.0 },
+        #[cfg(target_os = "linux")]
+        k if k == SDL_EVENT_DROP_FILE.0 => unsafe { event.drop.windowID.0 },
         _ => return,
     };
     let Some(id) = window_of(sdl_id) else {

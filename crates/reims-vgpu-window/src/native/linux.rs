@@ -6,6 +6,7 @@
 //! asks of it: what draws into the window ([`FrameSink`]), the window's opening, changes and end,
 //! posted to the UI thread, and the host's screens as SDL lists them.
 
+mod drop_files;
 mod input;
 mod keymap;
 mod render;

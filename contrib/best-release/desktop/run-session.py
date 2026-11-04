@@ -49,6 +49,31 @@ def stop_close_helper(child):
             child.wait(timeout=2)
 
 
+def optional_helper(run, name, arguments):
+    """Auxiliary services must never prevent macOS from starting."""
+    try:
+        with (run / (name + '.log')).open('a') as log:
+            return subprocess.Popen(arguments, stdout=log, stderr=log)
+    except Exception as error:
+        print(name + ' unavailable: ' + type(error).__name__, file=sys.stderr, flush=True)
+        try:
+            subprocess.run(['notify-send', 'Reims', name + ' unavailable; macOS will still start'], timeout=4,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return None
+
+
+def stop_optional(child):
+    if child is not None and child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=90)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=3)
+
+
 def main():
     os.umask(0o077)
     run = Path(sys.argv[1]).resolve(strict=True)
@@ -87,38 +112,74 @@ def main():
                  '-device', 'vmxnet3,netdev=raphael_lan,id=raphael_lan,mac=52:54:00:52:47:44,bus=pcie.0,addr=0x12']
         (run / 'runtime-network.json').write_text(json.dumps(network, indent=2) + '\n')
     helper_args = close_helper_args(run, args)
-    qemu = subprocess.Popen(args, pass_fds=() if lan_fd is None else (lan_fd,))
+    directory = Path(__file__).resolve().parent
+    settings_file = directory / 'desktop-settings.json'
+    settings = json.loads(settings_file.read_text()) if settings_file.is_file() else {}
+    optional = []
+    qemu = None
     controls = None
     close_helper = None
 
+    stop_requested = False
+
     def stop(*_):
-        if qemu.poll() is None:
+        nonlocal stop_requested
+        stop_requested = True
+        if qemu is not None and qemu.poll() is None:
             qemu.terminate()
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
+        if helper_args:
+            # Reuse only the already validated unique localhost SSH forward.
+            port = helper_args[helper_args.index('--ssh-port') + 1]
+            key = helper_args[helper_args.index('--ssh-key') + 1]
+            common = ['--run', str(run), '--ssh-port', port, '--ssh-key', key,
+                      '--known-hosts', str(directory / 'known_hosts')]
+            if settings.get('home_share', False):
+                optional.append(optional_helper(run, 'home-share',
+                    [sys.executable, '-B', str(directory / 'home-share.py'), *common]))
+            if settings.get('clipboard', False):
+                optional.append(optional_helper(run, 'guest-clipboard',
+                    [sys.executable, '-B', str(directory / 'guest-clipboard.py'), *common]))
+            os.environ.pop('REIMS_VGPU_DROP_SOCKET', None)
+            if settings.get('file_drop', False):
+                drop = optional_helper(run, 'file-drop',
+                    [sys.executable, '-B', str(directory / 'file-drop.py'), *common])
+                optional.append(drop)
+                deadline = time.monotonic() + 3
+                while drop is not None and drop.poll() is None and time.monotonic() < deadline:
+                    if (run / 'drop.sock').is_socket():
+                        os.environ['REIMS_VGPU_DROP_SOCKET'] = str(run / 'drop.sock')
+                        break
+                    time.sleep(0.025)
+        if stop_requested:
+            return 0
+        os.environ['REIMS_CLIPBOARD'] = '1' if settings.get('clipboard', True) else '0'
+        qemu = subprocess.Popen(args, pass_fds=() if lan_fd is None else (lan_fd,))
         if helper_args is not None:
-            with (run / 'close-guest.log').open('a') as log:
-                try:
-                    close_helper = subprocess.Popen(helper_args + ['--pid', str(qemu.pid)], stdout=log, stderr=log)
-                except OSError as error:
-                    log.write('Clean-close helper could not start: ' + repr(error) + '\n')
-                    log.flush()
-                    print('Clean-close helper unavailable; use the macOS Apple menu to shut down.', file=sys.stderr, flush=True)
-        with (run / 'controls.log').open('a') as log:
-            controls = subprocess.Popen([sys.executable, str(Path(__file__).with_name('desktop-controls.py')), str(run)], stdout=log, stderr=log)
-            result = qemu.wait()
-            (run / 'exit.json').write_text(json.dumps({'qemu_exit_code': result}) + '\n')
-            return result
+            close_helper = optional_helper(run, 'close-guest', helper_args + ['--pid', str(qemu.pid)])
+        controls = optional_helper(run, 'controls',
+            [sys.executable, str(directory / 'desktop-controls.py'), str(run)])
+        result = qemu.wait()
+        (run / 'exit.json').write_text(json.dumps({'qemu_exit_code': result}) + '\n')
+        return result
     finally:
-        stop_close_helper(close_helper)
-        if controls is not None and controls.poll() is None:
-            controls.terminate()
-            controls.wait(timeout=10)
-        # These units belong only to Reims, never the running Raphael VM.
+        # One failed auxiliary cleanup must not skip the other owned services.
+        for child in reversed(optional):
+            try:
+                stop_optional(child)
+            except Exception as error:
+                print('Auxiliary cleanup failed: ' + type(error).__name__, file=sys.stderr, flush=True)
+        for child in (close_helper, controls):
+            try:
+                stop_close_helper(child)
+            except Exception as error:
+                print('Desktop helper cleanup failed: ' + type(error).__name__, file=sys.stderr, flush=True)
         for slot in (1, 2):
-            subprocess.run(['systemctl', '--user', 'stop', f'reims-usbredir-{slot}.service'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['systemctl', '--user', 'stop', f'reims-usbredir-{slot}.service'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == '__main__':

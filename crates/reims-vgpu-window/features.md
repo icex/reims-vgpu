@@ -350,6 +350,12 @@ runtime's own device. The switches above apply, and `resolution=` too.
 - Leaving: closing a window asks the host to end the VM; the window closes
   at the display's release, once its swapchain is gone. `manual`
 
+- Optional host file/folder drops send each native path to a private nonblocking
+  datagram socket named by `REIMS_VGPU_DROP_SOCKET`; unset preserves existing
+  behaviour. A desktop companion copies to the guest Desktop. `manual` (real drag),
+  `test: native::linux::drop_files::dropped_paths_are_native_bytes_not_shell_or_lines`,
+  `test: native::linux::drop_files::drop_socket_is_private_and_preserves_a_whole_path`
+
 Not on Linux: a menu bar, Dock icon or ⌘Tab entry (the compositor's task
 bar shows the window, as `reims-vgpu`), the camera-housing fit, and trackpad
 gesture phases and momentum.

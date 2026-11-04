@@ -400,7 +400,7 @@ keychain_cleanup() {{
         kill "$keychain_writer" >/dev/null 2>&1 || :
         wait "$keychain_writer" >/dev/null 2>&1 || :
     fi
-    /usr/bin/launchctl bootout "gui/$(id -u)/$keychain_label" >/dev/null 2>&1 || :
+    /bin/launchctl bootout "gui/$(id -u)/$keychain_label" >/dev/null 2>&1 || :
     /usr/bin/python3 -c 'import shutil,sys;shutil.rmtree(sys.argv[1],ignore_errors=True)' "$keychain_temp"
 }}
 trap keychain_cleanup EXIT
@@ -414,7 +414,7 @@ root = Path(sys.argv[1])
 job = {{'Label': sys.argv[2], 'ProgramArguments': ['/usr/bin/python3', str(root/'worker.py'), str(root/'input'), str(root/'status.json')], 'RunAtLoad': True, 'ProcessType': 'Background', 'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}}
 (root/'job.plist').write_bytes(plistlib.dumps(job))
 KEYCHAIN_JOB
-/usr/bin/launchctl bootstrap "gui/$(id -u)" "$keychain_temp/job.plist"
+/bin/launchctl bootstrap "gui/$(id -u)" "$keychain_temp/job.plist"
 # printf is a shell builtin: its credential argument is never a process argv.
 printf %s {password} > "$keychain_temp/input" &
 keychain_writer=$!
@@ -460,7 +460,7 @@ if [ ! -e "$support/before.json" ]; then
     fi
     printf '{{"version":1}}\\n' > "$support/before.json"
 fi
-/usr/bin/launchctl bootout "gui/$(id -u)/org.raphael.linux-shares" >/dev/null 2>&1 || :
+/bin/launchctl bootout "gui/$(id -u)/org.raphael.linux-shares" >/dev/null 2>&1 || :
 if [ -f "$HOME/Library/LaunchAgents/org.raphael.linux-shares.plist" ]; then
     mv "$HOME/Library/LaunchAgents/org.raphael.linux-shares.plist" "$support/org.raphael.linux-shares.plist.disabled"
 fi
@@ -468,8 +468,8 @@ fi
 printf %s {shlex.quote(base64.b64encode(agent.encode()).decode())} | /usr/bin/base64 -D > "$support/mount.sh"
 chmod 700 "$support/mount.sh"
 printf %s {shlex.quote(base64.b64encode(plist).decode())} | /usr/bin/base64 -D > "$HOME/Library/LaunchAgents/org.reims.home-share.plist"
-/usr/bin/launchctl bootout "gui/$(id -u)/org.reims.home-share" >/dev/null 2>&1 || :
-/usr/bin/launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/org.reims.home-share.plist"
+/bin/launchctl bootout "gui/$(id -u)/org.reims.home-share" >/dev/null 2>&1 || :
+/bin/launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/org.reims.home-share.plist"
 if [ ! -e "$HOME/Desktop/Linux Home" ] && [ ! -L "$HOME/Desktop/Linux Home" ]; then
     ln -s /Volumes/{SHARE} "$HOME/Desktop/Linux Home"
 fi

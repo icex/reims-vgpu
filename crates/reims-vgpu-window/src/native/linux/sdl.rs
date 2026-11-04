@@ -61,6 +61,8 @@ pub(crate) struct State {
     /// The screen it opened on: SDL's answer to which screen a window is on is not used (the
     /// module doc).
     display: SDL_DisplayID,
+    /// Optional desktop file transport, opened once rather than on the frame path.
+    drop_files: Option<super::drop_files::DropFiles>,
 }
 
 /// A window's input: SDL's events, queued until the shell sends them (`super::input`).
@@ -180,7 +182,10 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
         sdl,
         asked: size,
         input: Input(input::Input::new()),
-        state: State { display },
+        state: State {
+            display,
+            drop_files: super::drop_files::DropFiles::from_environment(),
+        },
     })
 }
 
@@ -231,6 +236,20 @@ fn at(shell: &Shell, point: (f32, f32)) -> At {
 /// the window's input. Whether capture changed.
 pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bool {
     match kind {
+        k if k == SDL_EVENT_DROP_FILE.0 => {
+            // SAFETY: SDL keeps the drop event data alive during event dispatch.
+            let data = unsafe { event.drop.data };
+            if !data.is_null()
+                && let Some(sender) = &shell.os.drop_files
+            {
+                // SAFETY: SDL supplies a NUL-terminated native file name.
+                let path = unsafe { std::ffi::CStr::from_ptr(data) }.to_bytes();
+                if let Err(error) = sender.send(path) {
+                    log::warn!(target: "reims_vgpu_window", "file drop was not queued: {error}");
+                }
+            }
+            false
+        }
         k if k == SDL_EVENT_MOUSE_MOTION.0 => {
             // SAFETY: a motion event.
             let point = unsafe { (event.motion.x, event.motion.y) };
