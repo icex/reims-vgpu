@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """No VM, no Samba, no real home, and no live credentials in these tests."""
 import importlib.util
+import ast
+import base64
+import json
+import re
+import threading
+import types
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -71,16 +78,77 @@ class ShareTests(unittest.TestCase):
         secret = 'a' * 64
         payload = share.guest_installer(secret)
         self.assertEqual(payload.count(secret), 1)
-        self.assertIn('security -i >/dev/null 2>&1 <<KEYCHAIN', payload)
-        self.assertIn('login.keychain-db', payload)
+        self.assertIn('mkfifo -m 600', payload)
+        self.assertNotIn('<<KEYCHAIN\n', payload)
+        writer = next(line for line in payload.splitlines() if secret in line)
+        self.assertEqual(writer, 'printf %s ' + secret + ' > \"$keychain_temp/input\" &')
+        assets = re.findall(r'^printf %s ([A-Za-z0-9+/=]+) \| /usr/bin/base64 -D', payload, re.M)
+        self.assertEqual(len(assets), 3)
+        worker = base64.b64decode(assets[0]).decode()
+        ast.parse(worker)
+        self.assertIn('login.keychain-db', worker)
+        self.assertNotIn(secret, worker)
+        self.assertIn("subprocess.run(['/usr/bin/security', '-i'], input=", worker)
+        self.assertNotIn(secret, base64.b64decode(assets[1]).decode())
+        self.assertEqual(__import__('plistlib').loads(base64.b64decode(assets[2]))['StartInterval'], 15)
         agent = share.guest_agent()
         self.assertNotIn(secret, agent)
         self.assertIn('find-internet-password', agent)
         self.assertIn('with password sharePassword', agent)
-        self.assertIn('StartInterval', str(__import__('plistlib').loads(__import__('base64').b64decode(payload.split('printf %s ')[2].split(' |')[0]))))
         shell = subprocess.run(['/bin/sh', '-n'], input=payload, text=True, capture_output=True)
         self.assertEqual(shell.returncode, 0, shell.stderr)
         self.assertEqual(subprocess.run(['/bin/sh', '-n'], input=agent, text=True).returncode, 0)
+
+    def test_gui_worker_keeps_credential_in_security_stdin(self):
+        namespace = {'__name__': 'keychain_fixture'}
+        exec(compile(share.guest_keychain_worker(), '<fixture-worker>', 'exec'), namespace)
+        secret = b'b' * 64
+        with patch.object(namespace['subprocess'], 'run', return_value=subprocess.CompletedProcess([], 0)) as runner:
+            self.assertEqual(namespace['store_credential'](secret), 0)
+        self.assertEqual(runner.call_args.args[0], ['/usr/bin/security', '-i'])
+        self.assertIn(secret, runner.call_args.kwargs['input'])
+        self.assertTrue(runner.call_args.kwargs['input'].endswith(b'\n'))
+        self.assertEqual(runner.call_args.kwargs['stdout'], subprocess.DEVNULL)
+        self.assertEqual(runner.call_args.kwargs['stderr'], subprocess.DEVNULL)
+        self.assertEqual(runner.call_args.kwargs['timeout'], 20)
+
+    def test_gui_worker_fifo_status_has_no_credential(self):
+        namespace = {'__name__': 'keychain_fixture'}
+        exec(compile(share.guest_keychain_worker(), '<fixture-worker>', 'exec'), namespace)
+        secret = b'c' * 64
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            fifo, status = Path(temp) / 'input', Path(temp) / 'status.json'
+            os.mkfifo(fifo, 0o600)
+            def writer():
+                with fifo.open('wb') as stream:
+                    stream.write(secret)
+            thread = threading.Thread(target=writer)
+            with patch.object(namespace['sys'], 'argv', ['worker', str(fifo), str(status)]), patch.object(namespace['signal'], 'signal'), patch.object(namespace['signal'], 'alarm'), patch.object(namespace['subprocess'], 'run', return_value=subprocess.CompletedProcess([], 0)):
+                thread.start()
+                self.assertEqual(namespace['main'](), 0)
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(json.loads(status.read_text()), {'returncode': 0})
+            self.assertNotIn(secret.decode(), status.read_text())
+            self.assertEqual(fifo.stat().st_mode & 0o777, 0o600)
+
+    def test_gui_worker_invalid_fifo_data_returns_secretless_failure(self):
+        namespace = {'__name__': 'keychain_fixture'}
+        exec(compile(share.guest_keychain_worker(), '<fixture-worker>', 'exec'), namespace)
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            fifo, status = Path(temp) / 'input', Path(temp) / 'status.json'
+            os.mkfifo(fifo, 0o600)
+            def writer():
+                with fifo.open('wb') as stream:
+                    stream.write(b'$(bad input)')
+            thread = threading.Thread(target=writer)
+            with patch.object(namespace['sys'], 'argv', ['worker', str(fifo), str(status)]), patch.object(namespace['signal'], 'signal'), patch.object(namespace['signal'], 'alarm'), patch.object(namespace['subprocess'], 'run') as runner:
+                thread.start()
+                self.assertEqual(namespace['main'](), 1)
+                thread.join(timeout=2)
+                runner.assert_not_called()
+            self.assertEqual(json.loads(status.read_text()), {'returncode': 1, 'reason': 'ValueError'})
+            self.assertNotIn('bad input', status.read_text())
 
     def test_credentials_reject_shell_input(self):
         for password in ('$(id)', 'a' * 63, 'a' * 64 + '\n', '"' * 64):

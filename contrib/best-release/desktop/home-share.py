@@ -333,6 +333,109 @@ APPLESCRIPT
 '''
 
 
+def guest_keychain_worker(port=PORT):
+    """Secretless source run inside launchd's GUI audit session, never SSH's."""
+    return f'''#!/usr/bin/python3
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+
+
+def store_credential(password):
+    password = password.strip()
+    if len(password) != 64 or any(c not in b'0123456789abcdef' for c in password):
+        raise ValueError('Invalid credential format')
+    keychain = Path.home() / 'Library/Keychains/login.keychain-db'
+    command = "add-internet-password -U -a {ACCOUNT} -s 10.0.2.2 -p {SHARE} -P {int(port)} -r 'smb ' -l 'Reims Linux home' -T /usr/bin/security -T /usr/bin/osascript -w " + password.decode('ascii') + ' ' + shlex.quote(str(keychain)) + '\\n'
+    return subprocess.run(['/usr/bin/security', '-i'], input=command.encode(),
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=20).returncode
+
+
+def timeout(*_):
+    raise TimeoutError('Keychain setup timeout')
+
+
+def main():
+    fifo, status = map(Path, sys.argv[1:])
+    signal.signal(signal.SIGALRM, timeout)
+    signal.alarm(40)
+    result = {{'returncode': 1, 'reason': 'NoResult'}}
+    try:
+        with fifo.open('rb') as stream:
+            password = stream.read(66)
+        result = {{'returncode': store_credential(password)}}
+    except Exception as error:
+        result = {{'returncode': 1, 'reason': type(error).__name__}}
+    finally:
+        signal.alarm(0)
+        temp = status.with_suffix('.tmp')
+        temp.write_text(json.dumps(result) + '\\n')
+        temp.replace(status)
+    return result['returncode']
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+'''
+
+
+def guest_keychain_setup(password, port=PORT):
+    """Shell fragment whose only credential writer is a shell builtin to FIFO.
+
+    No credential heredoc is used: older shells may materialize heredocs in
+    regular temporary files. The job source/plist/status contain no secret.
+    """
+    worker = base64.b64encode(guest_keychain_worker(port).encode()).decode()
+    return f'''keychain_temp=$(/usr/bin/mktemp -d "$support/keychain.XXXXXXXX")
+chmod 700 "$keychain_temp"
+keychain_label="org.reims.home-keychain.$(basename "$keychain_temp")"
+keychain_writer=
+keychain_cleanup() {{
+    if [ -n "$keychain_writer" ]; then
+        kill "$keychain_writer" >/dev/null 2>&1 || :
+        wait "$keychain_writer" >/dev/null 2>&1 || :
+    fi
+    /usr/bin/launchctl bootout "gui/$(id -u)/$keychain_label" >/dev/null 2>&1 || :
+    /usr/bin/python3 -c 'import shutil,sys;shutil.rmtree(sys.argv[1],ignore_errors=True)' "$keychain_temp"
+}}
+trap keychain_cleanup EXIT
+trap 'exit 1' HUP INT TERM
+/usr/bin/mkfifo -m 600 "$keychain_temp/input"
+printf %s {shlex.quote(worker)} | /usr/bin/base64 -D > "$keychain_temp/worker.py"
+/usr/bin/python3 - "$keychain_temp" "$keychain_label" <<'KEYCHAIN_JOB'
+from pathlib import Path
+import plistlib,sys
+root = Path(sys.argv[1])
+job = {{'Label': sys.argv[2], 'ProgramArguments': ['/usr/bin/python3', str(root/'worker.py'), str(root/'input'), str(root/'status.json')], 'RunAtLoad': True, 'ProcessType': 'Background', 'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}}
+(root/'job.plist').write_bytes(plistlib.dumps(job))
+KEYCHAIN_JOB
+/usr/bin/launchctl bootstrap "gui/$(id -u)" "$keychain_temp/job.plist"
+# printf is a shell builtin: its credential argument is never a process argv.
+printf %s {password} > "$keychain_temp/input" &
+keychain_writer=$!
+keychain_wait=0
+while [ ! -f "$keychain_temp/status.json" ] && [ "$keychain_wait" -lt 45 ]; do
+    /bin/sleep 1
+    keychain_wait=$((keychain_wait + 1))
+done
+/usr/bin/python3 - "$keychain_temp/status.json" <<'KEYCHAIN_STATUS'
+import json,sys
+try:
+    result = json.load(open(sys.argv[1]))
+except (OSError,ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if result.get('returncode') == 0 else 1)
+KEYCHAIN_STATUS
+keychain_cleanup
+trap - EXIT HUP INT TERM
+'''
+
+
 def guest_installer(password, port=PORT):
     if len(password) != 64 or any(c not in '0123456789abcdef' for c in password):
         raise ValueError('Invalid credential format')
@@ -343,12 +446,13 @@ def guest_installer(password, port=PORT):
                            'RunAtLoad': True, 'StartInterval': 15,
                            'ProcessType': 'Background',
                            'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'})
-    # The old agent's full installer/config is archived on the guest once; its
-    # keychain items are untouched. Only the named obsolete agent is unloaded.
+    # Keychain access must happen in the GUI audit session. SSH's audit session
+    # may refuse even show-keychain-info while the GUI login keychain is open.
     return f'''set -eu
 umask 077
 support="$HOME/{support}"
 mkdir -p "$support" "$HOME/Library/LaunchAgents"
+{guest_keychain_setup(password, port)}
 if [ ! -e "$support/before.json" ]; then
     /usr/bin/defaults read com.apple.desktopservices DSDontWriteNetworkStores > "$support/network-stores.before" 2>/dev/null || :
     if [ -f "$HOME/Library/LaunchAgents/org.raphael.linux-shares.plist" ]; then
@@ -360,9 +464,6 @@ fi
 if [ -f "$HOME/Library/LaunchAgents/org.raphael.linux-shares.plist" ]; then
     mv "$HOME/Library/LaunchAgents/org.raphael.linux-shares.plist" "$support/org.raphael.linux-shares.plist.disabled"
 fi
-/usr/bin/security -i >/dev/null 2>&1 <<KEYCHAIN
-add-internet-password -U -a {ACCOUNT} -s 10.0.2.2 -p {SHARE} -P {int(port)} -r 'smb ' -l 'Reims Linux home' -T /usr/bin/security -T /usr/bin/osascript -w {password} "$HOME/Library/Keychains/login.keychain-db"
-KEYCHAIN
 /usr/bin/defaults write com.apple.desktopservices DSDontWriteNetworkStores -bool true
 printf %s {shlex.quote(base64.b64encode(agent.encode()).decode())} | /usr/bin/base64 -D > "$support/mount.sh"
 chmod 700 "$support/mount.sh"
@@ -372,7 +473,8 @@ printf %s {shlex.quote(base64.b64encode(plist).decode())} | /usr/bin/base64 -D >
 if [ ! -e "$HOME/Desktop/Linux Home" ] && [ ! -L "$HOME/Desktop/Linux Home" ]; then
     ln -s /Volumes/{SHARE} "$HOME/Desktop/Linux Home"
 fi
-/bin/sh "$support/mount.sh"
+# The GUI LaunchAgent performs the mount and can read the login keychain.
+# Calling mount.sh directly from this SSH audit session would fail again.
 '''
 
 
