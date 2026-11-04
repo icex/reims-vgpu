@@ -565,6 +565,10 @@ impl Reservation {
     }
 
     /// Account for a kernel export larger than the Vulkan allocation requested.
+    #[allow(
+        clippy::expect_used,
+        reason = "The kernel export must cover the requested allocation"
+    )]
     fn grow_to(&mut self, size: u64, budget: u64) -> Result<(), Refused> {
         let additional = size
             .checked_sub(self.bytes)

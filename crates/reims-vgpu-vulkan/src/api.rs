@@ -52,7 +52,7 @@ impl FramePixels {
         let texture = texture.copied("frame target pixels");
         // A private encoder of the API's frame, included in runtime failure numbering.
         command_buffer.made_encoder(false);
-        self.encode_copy(&command_buffer.raw, &texture);
+        self.encode_copy(&command_buffer.raw, texture);
     }
 
     fn encode_copy(&self, command_buffer: &rt::CommandBuffer, texture: &rt::Texture) {
@@ -85,6 +85,10 @@ impl FramePixels {
 
     /// Copy rows whose layout the API checked. Like a direct read of the texture, the host
     /// waits for frames whose pixels it needs before calling; no buffer bytes are modified.
+    #[allow(
+        clippy::expect_used,
+        reason = "Frame allocation and the C API validate these row bounds"
+    )]
     pub fn read(&self, dst: &mut [u8], bytes_per_row: usize) {
         let source = self
             .buffer
@@ -219,7 +223,7 @@ mod tests {
                             height: h,
                             depth: 1,
                         },
-                        &raw,
+                        raw,
                         0,
                         0,
                         rt::Origin { x: 0, y: 0, z: 0 },
@@ -227,7 +231,7 @@ mod tests {
                     )
                     .unwrap();
                 upload.end_encoding().unwrap();
-                pixels.encode_copy(&cb, &raw);
+                pixels.encode_copy(&cb, raw);
                 cb.commit().unwrap();
                 cb.wait_until_completed_for(std::time::Duration::from_secs(5))
                     .unwrap();

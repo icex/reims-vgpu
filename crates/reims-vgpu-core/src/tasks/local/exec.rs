@@ -522,7 +522,7 @@ impl<P: Platform> LocalTask<P> {
             if trace::on() {
                 // execfault: local task, refusal text. A ran/span-end event does not say
                 // whether decoding committed GPU work or returned a failure to the FIFO.
-                trace::event_text("execfault", &[task], &raised.exception().to_string());
+                trace::event_text("execfault", &[task], raised.exception());
             }
             log::warn!(
                 "task {}: exec faulted: {}",

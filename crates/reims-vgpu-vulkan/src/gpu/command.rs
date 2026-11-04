@@ -1699,7 +1699,7 @@ mod tests {
         let contents = target.contents().unwrap();
         // SAFETY: the shared buffer has COUNT * 16 bytes, and all its writers completed.
         let bytes = unsafe { std::slice::from_raw_parts(contents.as_ptr(), COUNT * 16) };
-        for (index, bytes) in bytes.chunks_exact(16).enumerate() {
+        for (index, bytes) in bytes.as_chunks::<16>().0.iter().enumerate() {
             assert!(bytes.iter().all(|&byte| byte == index as u8 + 1));
         }
     }

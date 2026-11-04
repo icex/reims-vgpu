@@ -21,7 +21,7 @@ spec.loader.exec_module(h)
 
 class Tests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix='', dir=P)
+        self.tmp = tempfile.TemporaryDirectory(prefix='', dir=os.environ.get('TMPDIR', P))
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.run = self.root / 'r'

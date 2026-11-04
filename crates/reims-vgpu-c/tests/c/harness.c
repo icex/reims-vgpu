@@ -488,6 +488,8 @@ static void check_device(void) {
     CHECK(disp != NULL);
     check_display_refusals(dev);
     if (disp) {
+        rvg_display_set_window_suspended(disp, true);
+        rvg_display_set_window_suspended(disp, false);
         RvgDisplayCoord pos = rvg_display_cursor_position(disp);
         CHECK(pos.x == 0xffff && pos.y == 0xffff);
         uint64_t guest = 1, host = 1;
