@@ -49,3 +49,32 @@ No-hardware checks:
 `python3 -m unittest discover -s contrib/best-release/desktop -p test_wayland_clipboard.py`.
 The unit checks do not establish compositor focus access, guest pasteboard
 behavior or keyboard capture; exercise both real pasteboards on a VM for those.
+
+## Home, clipboard and native drops
+
+The desktop supervisor accepts three independent booleans in its adjacent
+`desktop-settings.json`: `home_share`, `clipboard`, and `file_drop`. Enable all
+three for desktop integration. Older settings keep home sharing and drops off;
+text clipboard sharing retains its existing default. The controls window also
+has a live clipboard checkbox. On Wayland, only the data-control bridge owns
+clipboard signals; X11 uses the GTK clipboard client.
+
+`home-share.py` starts the locally available Samba image on host loopback only
+and configures the guest's removable login agent over the private SSH forward.
+Finder's Desktop/Linux Home link opens the writable host home. Dotfiles are
+visible with Cmd+Shift+period. The guest can read host credentials including
+`~/.ssh`; storage vetoes and read-only masks protect the VM's disks. See
+HOME-SHARE.md for exact protection semantics and removal.
+
+With file_drop enabled the supervisor creates a mode0600 datagram socket in its
+mode0700 run directory before QEMU starts, then sets REIMS_VGPU_DROP_SOCKET.
+Without this opt-in the native window has its existing behaviour. SDL drop
+paths are data, never shell code; the helper copies files/folders over SSH to
+macOS Desktop, preserves symlinks, selects an unused name, and reveals the copy
+in Finder. Host notifications show copying, completion or failure. Copying to
+the Finder location under the pointer and dragging files out of macOS are not
+provided. Auxiliary failures leave QEMU running; their logs are in the run dir.
+
+The guest clipboard bootstrap packages only authored sources, builds its small
+AppKit helper inside macOS, and retires the legacy clipboard job while keeping
+its files and prior state for rollback. See guest-clipboard/README.md.
