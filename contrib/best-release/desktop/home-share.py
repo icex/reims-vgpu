@@ -180,7 +180,7 @@ class HomeShare:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as admission:
             admission.bind(('127.0.0.1', self.port))
         private_directory(self.state)
-        for name in ('state', 'masked-storage'):
+        for name in ('masked-storage',):
             private_directory(self.state / name)
         credential = self.state / 'password'
         if not credential.exists():
@@ -213,7 +213,6 @@ class HomeShare:
                    '--tmpfs', '/var/cache/samba', '--tmpfs', '/var/lib/samba',
                    '--tmpfs', '/var/log/samba',
                    '--mount', f'type=bind,src={self.state},dst=/reims-config,readonly',
-                   '--mount', f'type=bind,src={self.state}/state,dst=/var/lib/samba/private',
                    '--mount', f'type=bind,src={self.home},dst={self.home}']
         protected = self.home / 'reims-9070xt'
         if protected.exists():

@@ -16,7 +16,8 @@ its login keychain, scoped to10.0.2.2,port4450,pathReimsHome,protocolSMB.
 
 The local image raphael-macos-shares:local supplies Samba and its existing
 macosshare UNIX account (checked UID/GID1000). This new service uses its own
-password database and does not touch the older Raphael container/service/state.
+password database in container tmpfs, regenerated from the private credential on
+every start. No root-owned Samba state is written to the host. It does not touch the older Raphael container/service/state.
 The container uses host networking, with smbd bound exclusively to127.0.0.1:4450;
 there is no published Docker bridge address and NetBIOS is disabled. Client URL:
 smb://10.0.2.2:4450/ReimsHome. All share operations run as UID/GID1000.

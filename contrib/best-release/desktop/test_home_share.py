@@ -80,6 +80,28 @@ class ShareTests(unittest.TestCase):
                     service.stop()
                 self.assertEqual(mocked.call_count, 1)
 
+    def test_start_keeps_database_in_tmpfs_and_no_password_argv(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp, patch.object(share.os, 'getuid', return_value=1000):
+            root = Path(temp)
+            service = share.HomeShare(root, home=root, state=root / 'config', port=0)
+            calls = []
+            def docker(*args, **_):
+                calls.append(args)
+                if args[0] == 'run':
+                    return subprocess.CompletedProcess(args, 0, 'fixture-id', '')
+                if args[0] == 'inspect' and '--format' in args:
+                    return subprocess.CompletedProcess(args, 0, 'true', '')
+                return subprocess.CompletedProcess(args, 1, '', '')
+            with patch.object(service, 'docker', side_effect=docker), patch.object(share.socket, 'create_connection'):
+                service.start()
+            command = next(c for c in calls if c[0] == 'run')
+            self.assertIn('host', command)
+            self.assertIn('/var/lib/samba', command)
+            self.assertFalse(any('dst=/var/lib/samba/private' in c for c in command))
+            credential = (root / 'config/password').read_text().strip()
+            self.assertFalse(any(credential in c for c in command))
+            self.assertEqual((root / 'config/password').stat().st_mode & 0o777, 0o600)
+
     def test_bootstrap_stops_without_ssh(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as temp, patch.object(share.os, 'getuid', return_value=1000):
             service = share.HomeShare(temp, home=temp)
