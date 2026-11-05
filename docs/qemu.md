@@ -2096,3 +2096,19 @@ in the parent workspace evidence directory for exact identities and outcomes.
 
 Keep the installed build and its matching saved image together. This test does
 not establish host-reboot restoration or guest wall-clock synchronization.
+
+### Fresh upstream performance screen,2026-11-05
+
+After installing animated save/restore progress, a fresh A B B A screen compared
+the installed disk-save build with upstream Reims1fe0acb6 + VRAM compatibility
+port2a8929ee, metal2vulkan219f0136 and QEMU1b41f5f5 with matching host controls.
+Four clean clone boots used8vCPU/16GiB,4K at240Hz, VRAM on and20us halt-poll.
+The authored120Hz animation averaged120.08 versus116.60callbacks/s and
+1.025 versus1.752GPU ms/frame. Both pairs showed the GPU regression; one
+upstream animation had a398.6ms callback gap. Drag throughput/CPU varied in
+opposite directions across pairs, while GPU cost regressed in both. No stack
+upgrade was promoted. Other newly available helpers were not separately
+performance-qualified. This is finite desktop-fixture evidence, not a broad
+stability or physical240Hz claim. The parent workspace retains the plan,
+source/binary bindings, raw timings, rejected preparation attempts, captures,
+cleanup and qualification limits in evidence/codex-20261105-upstream/AB-REPORT.md.
