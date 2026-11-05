@@ -1317,6 +1317,24 @@ mod tests {
         use super::*;
         use crate::device::test_support::ROOT_PAGE;
 
+        /// A host recovering a failed save detaches the retained source root before
+        /// accepting its blob; otherwise teardown in did_resume clears restored FIFO state.
+        #[test]
+        fn stopped_source_resume_restores_root_stamp_mapping() {
+            let t = dev();
+            resume_registers(&t, u32::MAX);
+            t.device.did_resume(Hold::NONE);
+            t.device.will_suspend();
+            let state = t.device.finish_suspend().expect("saved source state");
+            t.device.stop(Hold::NONE);
+            assert!(t.device.will_resume(Some(&state), None));
+            t.device.did_resume(Hold::NONE);
+            assert_eq!(t.device.root_fifo.atomics().enabled(), 1);
+            assert!(t.device.current_root_fifo().is_some());
+            assert!(t.device.stamp_memory.lock().is_some());
+            t.device.stop(Hold::NONE);
+        }
+
         /// A restored fault offset sets the root FIFO's register and mask bit 0 only: no fault
         /// stamp, no extra interrupt
         #[test]

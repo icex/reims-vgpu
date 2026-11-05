@@ -167,7 +167,7 @@ def save(run, qmp, source_pid, notify=lambda message: None):
                 raise RuntimeError('Disk save requires a paused machine outside guest S3.')
             notify('Saving macOS RAM and device state to disk…')
             qmp.command('migrate-set-parameters', {'max-bandwidth': 1024 ** 3})
-            qmp.command('migrate', {'uri': 'file:' + str(part)})
+            qmp.command('migrate', {'uri': 'file:' + str(part)}, timeout=120)
             migration_started = True
             deadline = time.monotonic() + SAVE_TIMEOUT
             while True:
@@ -209,6 +209,18 @@ def save(run, qmp, source_pid, notify=lambda message: None):
             # Closing a qcow2 can update its header timestamp after inactivation.
             manifest['disks'] = [identity(path) for path in drive_paths(args)]
             atomic_json(run / 'saved-machine.json', manifest)
+            if prior and prior['phase'] == 'restored' and prior['image'] != name:
+                try:
+                    previous_image = image_path(run, prior)
+                    previous_image.unlink()
+                    sync_directory(run)
+                except FileNotFoundError:
+                    pass
+                except (OSError, RuntimeError) as error:
+                    # The new image is already durable and its source has exited.
+                    # A cleanup failure never invalidates the new saved session.
+                    manifest['old_image_cleanup_note'] = str(error)
+                    atomic_json(run / 'saved-machine.json', manifest)
             notify('macOS saved to disk. Open the shortcut to restore this session.')
             return manifest
         except BaseException:
@@ -224,7 +236,7 @@ def save(run, qmp, source_pid, notify=lambda message: None):
                     except Exception:
                         # Do not resume while the migration writer could still read RAM.
                         raise
-                qmp.command('cont')
+                qmp.command('cont', timeout=120)
                 part.unlink(missing_ok=True)
                 if image is not None:
                     image.unlink(missing_ok=True)

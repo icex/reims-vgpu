@@ -2049,3 +2049,32 @@ Four new mapper tests pass, including host-only byte reconstruction. The
 capture interference was retained separately. Full macOS/GPU save/restore,
 GPU pixels, application state, physical USB/audio and host-reboot restore
 remain unqualified. The installed daily build is unchanged by this candidate.
+
+
+### macOS saved-machine validation,2026-11-05
+
+User authorized ending the stuck daily guest. Its QMP quit was not a clean
+guest shutdown. After exit and lease admission, disposable copies qualified
+full macOS save/process-exit/restore. Three native-close/shortcut cycles
+retained boot/WindowServer/app identity, unsaved text, new keyboard edits and
+rendered native-window captures. The initial QMP console capture was black
+because the existing ten-minute native-window readback throttle preserves its
+old surface; native captures with bracketing owned-window checks were used.
+
+An injected commit failure exposed an in-place source resume failure:
+finish_suspend retains a root; applying saved FIFO registers and then letting
+did_resume tear that retained root down clears the newly restored FIFO enable
+and stamp mapping. A child then hit device.stamp.write_without_memory. The
+QEMU recovery handler now calls rvg_device_stop before will_resume on that
+source only. Incoming devices that have already accepted their state do not
+stop again. A focused core test and a fresh real failed-save retry passed;
+two subsequent native save/restore cycles retained state and input. Core API
+behavior was preserved; the host call sequence was corrected.
+
+One earlier run received unexpected extra text while the native window was
+focused and was excluded, rather than classed as a pixel or heap corruption
+result. Minimize-on-close and restoration of prior host focus bound later
+checks. Evidence and separate cleanup/identity receipts are retained under
+parent-workspace evidence/codex-20261105-disk-save. Original disk identities
+matched after clone cleanup. Physical USB/audio, host reboot restoration and
+automatic guest wall-clock resynchronization remain outside this proof.

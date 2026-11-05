@@ -14,7 +14,7 @@ m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 class QMP:
     def __init__(self, run, fail=None):self.run=run;self.calls=[];self.state='paused';self.fail=fail
     def status(self):return self.state
-    def command(self, name, args=None):
+    def command(self, name, args=None, **kwargs):
         self.calls.append(name)
         if name=='migrate':
             self.part=Path(args['uri'].removeprefix('file:'));self.part.write_bytes(b'complete simulated machine image')
@@ -80,6 +80,14 @@ class Tests(unittest.TestCase):
     def test_unknown_phase_is_refused(self):
         r=self.save();r['phase']='damaged';m.atomic_json(self.run/'saved-machine.json',r)
         with self.assertRaisesRegex(RuntimeError,'phase'):m.validate_restore(self.run,self.args)
+    def test_successful_new_save_prunes_only_preceding_restored_image(self):
+        first=self.save();m.mark_restored(self.run);second=self.save()
+        self.assertFalse((self.run/first['image']).exists());self.assertTrue((self.run/second['image']).exists())
+        self.assertEqual(len(list(self.run.glob('saved-machine-*.bin'))),1)
+    def test_failed_new_save_preserves_preceding_image(self):
+        first=self.save();m.mark_restored(self.run)
+        with self.assertRaises(RuntimeError):self.save(QMP(self.run,'migration'))
+        self.assertTrue((self.run/first['image']).exists())
     def test_no_space_does_not_pause_or_quit(self):
         q=QMP(self.run)
         with patch.object(m.shutil,'disk_usage',return_value=type('Space',(),{'free':0})()),self.assertRaisesRegex(RuntimeError,'free space'):self.save(q)

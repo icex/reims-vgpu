@@ -1,38 +1,52 @@
 # Local desktop saved machines, RAM pause and host sleep
 
-## Disk-backed saved-machine candidate — not yet qualified or installed
+## Disk-backed saved machines
 
-The user's requested X behavior is a full machine save to SSD/HDD followed by
-QEMU exit, with the same session restored by the shortcut. RAM pause is only
-the earlier installed interim behavior; it does not satisfy that requirement.
+The `disk_save: true` launcher policy saves RAM and devices to SSD/HDD on X,
+then exits QEMU. The shortcut restores the same session in a new QEMU process.
+`save-state=on` is explicit; the graphics migration blocker remains for other
+builds/policies. The local launcher pins the measured invariant-TSC frequency.
 
-The experimental `disk_save: true` launcher setting enables apple-gfx
-`save-state=on` and passes `--disk-save` to the companion. It flushes and tears
-down GPU tasks before QEMU copies RAM, saves the GPU blob and IOSurface mapper
-mapping IDs/host-only bytes, and includes USB audio and AppleSMC device state.
-The normal host-sleep policy still permits host suspend and never holds a
-blocking sleep inhibitor.
+`saved-machine.py` waits for migration completion, fsyncs the image and manifest,
+then quits the bound QEMU process. Before commit, write errors preserve the
+source in RAM and recover its GPU state. The window minimizes immediately on X.
+The next successful save removes only the preceding restored image, retaining
+one current checkpoint. Image/manifest permissions are private to the account.
 
-`saved-machine.py` writes a private image, waits for migration completion,
-fsyncs the image and manifest, then exits the bound QEMU process. A failure
-before durable commit never sends quit. The shortcut validates the image hash,
-exact QEMU build/configuration and unchanged disk identities before starting
-`-incoming`; a changed or incomplete save never falls back to a cold boot.
-Interrupted restore is recorded explicitly before CPUs resume. Saved images
-contain guest RAM and stay private to the owning account.
+Before restore, exact QEMU build/configuration, unchanged disk identities and
+image size/hash must match. A damaged or interrupted restore never silently
+falls back to a cold boot. The restore-in-progress marker is durable before
+vCPUs resume. Repeated shortcut opens are serialized. Full shutdown remains a
+separate action; restore a saved session before requesting a guest shutdown.
 
-Candidate checks:4 mapper roundtrip/parser tests;62 IOSurface tests serially;
-14 transaction/failure tests; stopped64MiB QEMU save/exit/restore with USB audio
-and a partially completed AppleSMC command, with no GPU access. Library and
-QEMU builds and library/API clippy pass. These do NOT prove macOS/GPU recovery.
-The healthy daily guest is preserved pending user approval to shut it down
-for an isolated macOS save/restore roundtrip. Do not promote this candidate
-until its desktop, unsaved state, input, disk pairing and failure recovery pass.
+The patch suspends GPU tasks before copying RAM, includes mapper IDs and
+host-only surface bytes, and saves USB audio and AppleSMC protocol state.
+A failed save detaches the retained GPU root before accepting its saved
+registers; otherwise teardown would clear restored FIFO/stamp state.
 
-The exact local candidate launcher is under `local-launcher/`; its cache paths
-are this host's. See `evidence/codex-20261105-disk-save/` in the parent workspace.
+Observed on2026-11-05: a direct macOS process-exit/restore, three native X /
+shortcut cycles, and two further cycles after a real injected manifest-write
+failure. The latter recovered the same source VM and accepted a new keyboard
+edit. Cycles retained guest boot, WindowServer/app PIDs, unsaved Cocoa text,
+fresh edits and rendered native-window output. One earlier cycle with unexpected
+extra keyboard input was excluded; the window now minimizes at save start and
+the harness restores prior host focus. Original disk identities stayed unchanged
+through disposable-clone tests. No physical USB/audio or host-reboot claim.
 
-## Earlier installed RAM-only policy
+The installed bundle is retained under
+`~/.local/lib/reims-vgpu/saved-machine-20261105`; build caches are separate.
+`local-launcher/` records this machine's installed launcher/settings. The
+host remains free to sleep: there is no blocking sleep inhibitor, only a short
+logind preparation delay while a live guest is paused. A saved guest holds no
+QEMU process or sleep inhibitor. Guest wall-clock correction after time spent
+saved is not qualified and remains a known limitation without guest tools.
+
+Focused tests: `test_saved_machine.py`, `test_saved_icon.py`, `test_sleep.py`,
+`test_close_guest.py`, `test_session_close.py`; mapper/core regression tests;
+exact-binary emulated-device and macOS roundtrips. Evidence is in
+`evidence/codex-20261105-disk-save/` in the parent workspace.
+
+## RAM-only compatibility policy
 
 
 The desktop shortcut starts macOS or resumes its retained RAM session.

@@ -131,6 +131,7 @@ def main():
                             if qmp.status() != 'paused':
                                 legacy.record('stale-native-close-ignored', state=qmp.status())
                                 continue
+                            control.window(opts.pid, 'minimize')
                             host.saving = True
                             result = saved.save(run, qmp, opts.pid, legacy.notify)
                             legacy.record('native-close-saved-to-disk', image=result['image'], bytes=result['image_size'])

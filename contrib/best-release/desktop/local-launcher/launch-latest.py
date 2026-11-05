@@ -41,9 +41,9 @@ def main():
     if channel == 'best' and close_action not in ('pause', 'suspend', 'powerdown'):
         parser.error('close_action must be pause, suspend or powerdown')
     build, dist, manifest = {
-        'best': (Path('/home/bogdan/.cache/reims-disk-save-20261105/bundle/bin'),
-            Path('/home/bogdan/.cache/reims-disk-save-20261105/bundle'),
-            '/home/bogdan/.cache/reims-disk-save-20261105/bundle/manifest.json'),
+        'best': (Path('/home/bogdan/.local/lib/reims-vgpu/saved-machine-20261105/bin'),
+            Path('/home/bogdan/.local/lib/reims-vgpu/saved-machine-20261105'),
+            '/home/bogdan/.local/lib/reims-vgpu/saved-machine-20261105/manifest.json'),
         'daily': (Path('/home/bogdan/.cache/reims-proven-fixes-20261024/bundle/bin'),
             Path('/home/bogdan/.cache/reims-proven-fixes-20261024/bundle'),
             '/home/bogdan/.cache/reims-proven-fixes-20261024/bundle/manifest.json'),

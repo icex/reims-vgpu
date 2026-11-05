@@ -1,5 +1,5 @@
 diff --git a/hw/display/apple-gfx-pci.c b/hw/display/apple-gfx-pci.c
-index 1dede8993c..c93407b1d1 100644
+index 1dede8993c..1bd24431df 100644
 --- a/hw/display/apple-gfx-pci.c
 +++ b/hw/display/apple-gfx-pci.c
 @@ -24,6 +24,13 @@
@@ -28,7 +28,7 @@ index 1dede8993c..c93407b1d1 100644
      bool efi_fb_bar;
      MemoryRegion efi_fb_bar_mr; /* BAR 2 */
      MemoryRegion efi_fb; /* in BAR 2: an alias of the machine's RAM */
-@@ -52,6 +64,187 @@ struct AppleGFXPCIState {
+@@ -52,6 +64,194 @@ struct AppleGFXPCIState {
  #define APPLE_GFX_PCI_PAGE_SHIFT 14
  #endif
  
@@ -63,8 +63,15 @@ index 1dede8993c..c93407b1d1 100644
 +        return;
 +    }
 +    /* VM change handlers run before resume_all_vcpus(). */
-+    if (!s->saved_accepted && !apple_gfx_saved_accept(s, &error_fatal)) {
-+        return;
++    if (!s->saved_accepted) {
++        /* finish_suspend retains the source root node. Detach it BEFORE
++         * will_resume restores registers: did_resume tears an existing root
++         * down, which would otherwise clear the just-restored FIFO enable
++         * and stamp-memory mapping. Incoming VMs have accepted a fresh root. */
++        rvg_device_stop(s->common.pgdev);
++        if (!apple_gfx_saved_accept(s, &error_fatal)) {
++            return;
++        }
 +    }
 +    rvg_device_did_resume(s->common.pgdev);
 +    apple_gfx_saved_clear(s);
@@ -216,7 +223,7 @@ index 1dede8993c..c93407b1d1 100644
  static void apple_gfx_pci_init(Object *obj)
  {
      AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
-@@ -63,6 +256,11 @@ static void apple_gfx_pci_finalize(Object *obj)
+@@ -63,6 +263,11 @@ static void apple_gfx_pci_finalize(Object *obj)
  {
      AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
  
@@ -228,7 +235,7 @@ index 1dede8993c..c93407b1d1 100644
      apple_gfx_common_finalize(&s->common);
  }
  
-@@ -260,6 +458,12 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
+@@ -260,6 +465,12 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
          /* Validation failed before the library accepted the callback table. */
          apple_gfx_pci_irq_destroy(irq);
      }
@@ -241,7 +248,7 @@ index 1dede8993c..c93407b1d1 100644
  }
  
  static void apple_gfx_pci_reset(Object *obj, ResetType type)
-@@ -298,6 +502,7 @@ static const Property apple_gfx_pci_properties[] = {
+@@ -298,6 +509,7 @@ static const Property apple_gfx_pci_properties[] = {
       */
      DEFINE_PROP_STRING("resolution", AppleGFXPCIState, common.resolution),
      DEFINE_PROP_STRING("close-action", AppleGFXPCIState, common.close_action),
@@ -249,7 +256,7 @@ index 1dede8993c..c93407b1d1 100644
      /*
       * With a window, the least milliseconds between two reads of a frame
       * back into QEMU's console surface (a SPICE or VNC listener's, a
-@@ -317,6 +522,7 @@ static void apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
+@@ -317,6 +529,7 @@ static void apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
  
      rc->phases.hold = apple_gfx_pci_reset;
      dc->desc = "macOS Paravirtualized Graphics PCI Display Controller";
@@ -257,7 +264,7 @@ index 1dede8993c..c93407b1d1 100644
      dc->hotpluggable = false;
      set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
  
-@@ -451,6 +657,7 @@ static void apple_gfx_iosurface_pci_realize(PCIDevice *dev, Error **errp)
+@@ -451,6 +664,7 @@ static void apple_gfx_iosurface_pci_realize(PCIDevice *dev, Error **errp)
                         TYPE_APPLE_GFX_IOSURFACE_PCI);
              return;
          }
@@ -265,7 +272,7 @@ index 1dede8993c..c93407b1d1 100644
      }
      /*
       * apple-gfx-pci maps through the process's latest IOSurface device, so a
-@@ -486,6 +693,8 @@ static void apple_gfx_iosurface_pci_realize(PCIDevice *dev, Error **errp)
+@@ -486,6 +700,8 @@ static void apple_gfx_iosurface_pci_realize(PCIDevice *dev, Error **errp)
          error_setg(errp, "%s: rvg_iosurface_device_create: %s",
                     TYPE_APPLE_GFX_IOSURFACE_PCI, rvg_status_message(status));
          msi_uninit(dev);
@@ -274,7 +281,7 @@ index 1dede8993c..c93407b1d1 100644
      }
  }
  
-@@ -538,6 +747,16 @@ static const Property apple_gfx_iosurface_pci_properties[] = {
+@@ -538,6 +754,16 @@ static const Property apple_gfx_iosurface_pci_properties[] = {
                       AppleGFXPCIState *),
  };
  
@@ -291,7 +298,7 @@ index 1dede8993c..c93407b1d1 100644
  static void apple_gfx_iosurface_pci_class_init(ObjectClass *klass,
                                                 const void *data)
  {
-@@ -546,6 +765,7 @@ static void apple_gfx_iosurface_pci_class_init(ObjectClass *klass,
+@@ -546,6 +772,7 @@ static void apple_gfx_iosurface_pci_class_init(ObjectClass *klass,
      ResettableClass *rc = RESETTABLE_CLASS(klass);
  
      dc->desc = "macOS Paravirtualized Graphics IOSurface Mapper";

@@ -190,6 +190,12 @@ def guest_state():
     return service
 
 
+def ensure_not_migrating(qmp):
+    migration = qmp.command('query-migrate').get('status')
+    if migration not in (None, 'none', 'failed', 'cancelled', 'completed'):
+        raise RuntimeError('macOS is still saving or cancelling a save. Wait for it to finish.')
+
+
 def powerdown():
     service = state()
     if service not in ('active', 'activating'):
@@ -205,6 +211,7 @@ def powerdown():
     # Wake a sleeping guest before delivering its ordinary ACPI shutdown.
     # Never terminate QEMU or request Linux host sleep here.
     with QMP(current_run()) as qmp:
+        ensure_not_migrating(qmp)
         status = qmp.status()
         if status == 'paused':
             qmp.command('cont')
@@ -260,10 +267,14 @@ def main():
                 except BlockingIOError:
                     notify('macOS is saving to disk. Wait for saving to finish.')
                     return
+                with QMP(run) as qmp:
+                    ensure_not_migrating(qmp)
                 control = runpy.run_path(str(ROOT / 'sleep-control.py'))
                 control['transition'](run, 'resume')
             notify('macOS resumed. Your session is retained.')
             return
+        if restoring:
+            notify('Checking the saved macOS state and restoring from disk…')
         with open('/var/tmp/reims-host-workload.lock', 'a') as lease:
             try:
                 fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)

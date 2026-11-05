@@ -20,6 +20,13 @@ class QMP:
 class Tests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.run=Path(self.tmp.name)
+    def test_active_migration_cannot_resume(self):
+        for status in ('active','setup','cancelling','pre-switchover','postcopy-active'):
+            q=Mock();q.command.return_value={'status':status}
+            with self.assertRaises(RuntimeError):api['ensure_not_migrating'](q)
+    def test_terminal_migration_allows_source_recovery(self):
+        for status in ('completed','failed','cancelled',None):
+            q=Mock();q.command.return_value={'status':status};api['ensure_not_migrating'](q)
     def test_marker_is_durable_before_guest_execution(self):
         events=[];q=QMP(events)
         saved={'mark_restoring':lambda run,pid:events.append('restore marker durable'),
