@@ -153,3 +153,12 @@ its files and prior state for rollback. See guest-clipboard/README.md.
 
 Dropped files land in macOS Desktop and can sync to iCloud. The home-share
 shortcut stays at ~/Linux Home, outside Desktop/Documents/iCloud Drive.
+
+
+Saved-machine operations show a non-cancelling Zenity progress window. Saving
+reports QEMU's written/remaining memory counts, then flushing, verification and
+closing phases. Restore uses an animated bar while validation and incoming
+state loading run; it does not invent a percentage for phases QEMU cannot
+measure. On KDE the feedback stays above the incoming VM window. Closing the
+feedback window does not cancel the operation. Missing/closed UI never changes
+the durable-save transaction or guest recovery behavior. Requires `zenity`.

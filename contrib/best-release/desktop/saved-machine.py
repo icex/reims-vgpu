@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import runpy
 import stat
 import time
 import uuid
@@ -142,6 +143,12 @@ def validate_restore(run, args):
 
 
 def save(run, qmp, source_pid, notify=lambda message: None):
+    progress = runpy.run_path(str(Path(__file__).with_name('machine-progress.py')))['Progress']
+    with progress('Saving macOS to disk') as display:
+        return _save(run, qmp, source_pid, notify, display.update)
+
+
+def _save(run, qmp, source_pid, notify, progress):
     """QMP must be bound to the validated owned child. Failure keeps its RAM process alive."""
     run = run.resolve(strict=True)
     with (run / 'saved-machine.lock').open('a') as lock:
@@ -165,6 +172,7 @@ def save(run, qmp, source_pid, notify=lambda message: None):
                 qmp.command('stop')
             if qmp.status() != 'paused':
                 raise RuntimeError('Disk save requires a paused machine outside guest S3.')
+            progress('Preparing memory and graphics state…')
             notify('Saving macOS RAM and device state to disk…')
             qmp.command('migrate-set-parameters', {'max-bandwidth': 1024 ** 3})
             qmp.command('migrate', {'uri': 'file:' + str(part)}, timeout=120)
@@ -173,6 +181,10 @@ def save(run, qmp, source_pid, notify=lambda message: None):
             while True:
                 migration = qmp.command('query-migrate')
                 phase = migration.get('status')
+                ram = migration.get('ram', {})
+                transferred = ram.get('transferred', 0) / 1024 ** 3
+                remaining = ram.get('remaining', 0) / 1024 ** 3
+                progress(f'Saving memory: {transferred:.1f} GiB written, {remaining:.1f} GiB remaining…')
                 if phase == 'completed':
                     break
                 if phase in ('failed', 'cancelled'):
@@ -182,11 +194,13 @@ def save(run, qmp, source_pid, notify=lambda message: None):
                 time.sleep(.2)
             # Migration completion includes block-device inactivation/flush. Commit only
             # after the complete image and manifest are durable on this filesystem.
+            progress('Flushing the saved state to disk…')
             with part.open('rb') as image:
                 os.fsync(image.fileno())
             os.replace(part, run / name)
             sync_directory(run)
             image = run / name
+            progress('Verifying the saved memory image…')
             manifest = dict(format=FORMAT, phase='saved', image=name,
                             image_size=image.stat().st_size, image_sha256=digest(image),
                             qemu_sha256=digest(args[0]), command=args,
@@ -194,6 +208,7 @@ def save(run, qmp, source_pid, notify=lambda message: None):
                             disks=[identity(path) for path in drive_paths(args)])
             atomic_json(run / 'saved-machine.json', manifest)
             committed = True
+            progress('Finishing the save and closing the machine…')
             # No guest shutdown or reset: terminate only after the saved state is durable.
             try:
                 qmp.command('quit')
@@ -224,6 +239,7 @@ def save(run, qmp, source_pid, notify=lambda message: None):
             notify('macOS saved to disk. Open the shortcut to restore this session.')
             return manifest
         except BaseException:
+            progress('Save needs attention; recovering the running session…')
             if not committed:
                 if migration_started:
                     try:

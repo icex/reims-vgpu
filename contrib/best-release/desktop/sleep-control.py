@@ -17,6 +17,7 @@ ICON = Path.home() / '.local/bin/reims-macos'
 def window(pid, action):
     changes = {'minimize': 'w.minimized=true;',
                'show': 'w.minimized=false;workspace.activeWindow=w;',
+               'progress': 'w.keepAbove=true;w.minimized=false;workspace.activeWindow=w;',
                'query': '', 'close': 'w.closeWindow();'}
     token = 'reims_sleep_' + str(time.time_ns())
     script = ('var ws=workspace.windowList().filter(w=>w.pid===' + str(int(pid)) + ');'

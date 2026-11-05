@@ -224,7 +224,7 @@ def powerdown():
     notify('Shutdown requested. macOS will stop when it finishes shutting down.')
 
 
-def main():
+def _main():
     action = sys.argv[1] if len(sys.argv) > 1 else 'start'
     if action == 'status':
         settings = json.loads((ROOT / 'desktop-settings.json').read_text())
@@ -290,6 +290,18 @@ def main():
             notify('macOS is starting using the saved Reims build and display settings.')
     else:
         raise RuntimeError('Usage: reims-macos [start|stop|status [--notify]|usb]')
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else 'start'
+    session = saved_session() if action == 'start' else None
+    if session and session[2]['phase'] in ('saved', 'restoring'):
+        progress = runpy.run_path(str(ROOT / 'machine-progress.py'))['Progress']
+        with progress('Restoring macOS from disk') as display:
+            display.update('Checking the saved memory image and restoring your session…')
+            _main()
+    else:
+        _main()
 
 
 if __name__ == '__main__':
