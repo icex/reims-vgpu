@@ -1,27 +1,50 @@
-# Local desktop clean-close integration
+# Local desktop RAM pause and host sleep
 
-These scripts are the local desktop fork companion to the QEMU close-action
-property. Install close-guest.py next to run-session.py and the desktop controls;
-the reims-macos script is the start/stop/status/USB desktop entry point.
+The desktop shortcut starts macOS or resumes its retained RAM session.
+Native window X selects QEMU `close-action=pause`: QEMU pauses its CPUs,
+keeps its RAM/devices alive, and notifies `close-guest.py`. The helper
+minimizes the existing KDE window. Reopening the shortcut continues QEMU
+and restores that same window. No ACPI power button, guest S3, SDL hide/show,
+or shutdown is used for X. Closing repeatedly never forces power off.
 
-A best-channel launcher adds a dedicated second monitor:
-`-qmp unix:RUN/close-events.sock,server=on,wait=off`.
-The regular `RUN/qmp.sock` remains the icon/control connection. Select the
-apple-gfx `close-action=powerdown` fallback when guest S3 is refused. The
-supervisor derives a unique localhost guest SSH forward and disk from its
-known QEMU argv and binds the helper to its actual child PID/executable/disk.
-The guest SSH key defaults to `~/macos-vm/vmkey`; key bytes are never packaged.
+This is RAM pause, not disk hibernation. Ending QEMU, powering off, or
+rebooting the host loses unsaved RAM state. Use the shortcut's explicit
+"Request macOS shutdown" action for ordinary shutdown and save dialogs.
+`close-events.py` retains the key-only SSH shutdown fallback and identity
+checks; only an explicit shutdown request selects it.
 
-POWERDOWN also requests ordinary guest shutdown over local SSH because a
-guest policy may ignore its ACPI power button. The companion never terminates
-QEMU, discards documents or requests host sleep. Save dialogs may delay
-shutdown; finish them inside the guest. Duplicate pending closes are coalesced.
+Install `close-guest.py`, `close-events.py`, and `sleep-control.py` beside
+`run-session.py`. Install `reims-macos` executable in `~/.local/bin` and
+`reims-macos.desktop` in the desktop/application directories. The best
+launcher must expose both `RUN/qmp.sock` and `RUN/close-events.sock`, and
+set `close_action` to `pause`. Apply `../qemu-ram-pause.patch` to the pinned
+QEMU source; `../build.sh` applies it and runs its policy check.
+`local-launcher/` preserves this machine's exact installed launcher/settings;
+its build paths are local and must be adjusted when using another bundle.
 
-Pure socket/supervisor tests: `python3 -B test_close_guest.py` and
-`python3 -B test_session_close.py`. They launch no QEMU, SSH or GPU workload.
-The hardware gate must verify native close callback, guest SHUTDOWN event,
-QEMU exit, next-boot filesystem state and host-suspend safety separately.
+The VM launcher must run `python3 -B run-session.py RUN` directly, without
+`systemd-inhibit --mode=block`. The helper's logind **delay** inhibitor lets
+normal host sleep proceed after it pauses the guest; it does not block sleep.
+On host wake a previously running guest resumes automatically. A guest
+already paused with X stays paused until the shortcut is opened. Monitor
+idle/sleep is allowed. Requires KDE KWin scripting, qdbus6, journalctl,
+Python dbus/GLib and notify-send. Other desktops need their own window control.
 
+Validation on 2026-11-05: ten native-close/shortcut-resume cycles retained
+an authored unsaved Cocoa text window, guest/WindowServer/application PIDs,
+keyboard editing, and the same native host window. Physical host suspend
+measured 23.888 seconds; the same guest/app processes and recorded contents
+survived, and QEMU resumed automatically. The post-wake fixture window was
+not on screen, so further interactive fixture checks were not qualified.
+**Known limitation:** the guest clock remained about 30 seconds behind
+following that host cycle; NTP query confirmed the offset. Automatic clock
+resynchronization is not qualified. Guest administrator credentials were
+not accessed. Detailed evidence: `evidence/codex-20261105-sleep/` in the
+parent workspace. This does not qualify disk hibernation, host reboot
+session retention, or sustained rendering performance.
+
+Focused tests (no VM/SSH/GPU launch): `python3 -B test_sleep.py`,
+`python3 -B test_close_guest.py`, `python3 -B test_session_close.py`.
 
 The optional `desktop-controls.py` connects the private SPICE text clipboard.
 On Wayland it uses installed `wl-paste`/`wl-copy` data-control access, so the

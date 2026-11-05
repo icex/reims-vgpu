@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=macOS (Reims / RX 9070 XT)
+Comment=Close pauses macOS in RAM; reopen to resume the same session
+Exec=/home/bogdan/.local/bin/reims-macos
+Icon=computer
+Terminal=false
+Categories=System;Emulator;
+Actions=usb;stop;status;
+
+[Desktop Action usb]
+Name=USB devices…
+Exec=/home/bogdan/.local/bin/reims-macos usb
+
+[Desktop Action stop]
+Name=Request macOS shutdown
+Exec=/home/bogdan/.local/bin/reims-macos stop
+
+[Desktop Action status]
+Name=Status
+Exec=/home/bogdan/.local/bin/reims-macos status --notify

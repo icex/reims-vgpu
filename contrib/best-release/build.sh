@@ -36,10 +36,19 @@ if [[ ! -d "$ROOT/vendor/qemu/subprojects/keycodemapdb/.git" ]]; then
  git clone https://github.com/qemu/keycodemapdb.git "$ROOT/vendor/qemu/subprojects/keycodemapdb"
  git -C "$ROOT/vendor/qemu/subprojects/keycodemapdb" checkout --detach f5772a62ec52591ff6870b7e8ef32482371f22c6
 fi
+# Native X pauses without delivering an ACPI power button to the guest.
+PAUSE_PATCH="$ROOT/contrib/best-release/qemu-ram-pause.patch"
+if git -C "$ROOT/vendor/qemu" apply --reverse --check "$PAUSE_PATCH" 2>/dev/null; then
+ : # Already applied to this private checkout.
+else
+ git -C "$ROOT/vendor/qemu" apply --check "$PAUSE_PATCH"
+ git -C "$ROOT/vendor/qemu" apply "$PAUSE_PATCH"
+fi
 export PKG_CONFIG_PATH="$OUT/bundle/lib/pkgconfig:$OUT/slirp-prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 mkdir -p "$OUT/qemu-build"
 cd "$OUT/qemu-build"
 "$ROOT/vendor/qemu/configure" --target-list=x86_64-softmmu --enable-kvm --enable-pvg --disable-sdl --enable-gtk --enable-spice --enable-usb-redir --enable-pa --enable-slirp --disable-docs --disable-tests --disable-werror --disable-rust --disable-download "--python=${PYTHON:-python3}"
+python3 "$ROOT/vendor/qemu/tests/unit/test-apple-gfx-close.py" "$OUT/test-close-policy"
 ninja -j "$JOBS" qemu-system-x86_64
 cp qemu-system-x86_64 "$OUT/bundle/bin/"
 cp "$ROOT/vendor/qemu/scripts/reims-unix-tcp-relay.py" "$OUT/bundle/bin/"

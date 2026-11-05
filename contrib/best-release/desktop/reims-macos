@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Desktop controls for the existing independent Reims macOS launcher."""
 import fcntl
+import runpy
 import json
 import os
 from pathlib import Path
@@ -146,10 +147,13 @@ def powerdown():
     # Never terminate QEMU or request Linux host sleep here.
     with QMP(current_run()) as qmp:
         status = qmp.status()
-        if status == 'suspended':
+        if status == 'paused':
+            qmp.command('cont')
+        elif status == 'suspended':
             qmp.wake()
         elif status != 'running':
             raise RuntimeError('Cannot request a clean macOS shutdown while QEMU is ' + status + '.')
+        (current_run() / 'explicit-shutdown.request').write_text(str(time.time()))
         qmp.command('system_powerdown')
     notify('Shutdown requested. macOS will stop when it finishes shutting down.')
 
@@ -174,13 +178,9 @@ def main():
             notify('macOS is already starting.')
             return
         if service == 'active':
-            with QMP(current_run()) as qmp:
-                status = qmp.status()
-                if status == 'suspended':
-                    qmp.wake()
-                    notify('macOS resumed.')
-                else:
-                    notify('macOS is already running (QEMU state: ' + status + ').')
+            control = runpy.run_path(str(ROOT / 'sleep-control.py'))
+            control['transition'](current_run(), 'resume')
+            notify('macOS resumed. Your session is retained.')
             return
         with open('/var/tmp/reims-host-workload.lock', 'a') as lease:
             try:

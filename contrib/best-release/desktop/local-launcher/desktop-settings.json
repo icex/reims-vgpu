@@ -1,0 +1,13 @@
+{
+  "resolution": "3840x2160@220",
+  "refresh_hz": 240,
+  "channel": "best",
+  "vcpus": 8,
+  "ram_gb": 16,
+  "run": "/home/bogdan/reims-9070xt/runs/20261018-000858-tahoe",
+  "halt_poll_ns": 20000,
+  "close_action": "pause",
+  "home_share": true,
+  "clipboard": true,
+  "file_drop": true
+}

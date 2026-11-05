@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch, Mock
 
 P = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location('helper', P / 'close-guest.py')
+spec = importlib.util.spec_from_file_location('helper', P / 'close-events.py')
 h = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(h)
 
@@ -129,7 +129,8 @@ class Tests(unittest.TestCase):
             handler.tick()
             handler.event({'event':'POWERDOWN'})
             popen.assert_called_once()
-            self.assertIn('VM remains running', notify.call_args.args[0])
+            self.assertIn('retry automatically', notify.call_args.args[0])
+            self.assertIsNotNone(handler.retry_at)
             child.terminate.assert_not_called()
             child.kill.assert_not_called()
         with patch.object(h, 'notify') as notify, patch.object(h.subprocess, 'Popen', side_effect=OSError('no ssh')) as popen:
