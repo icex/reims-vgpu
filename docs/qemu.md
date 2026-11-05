@@ -2023,7 +2023,7 @@ flag set. The co-author found a root disk without FileVault needs it.
   and the system's hot keys among them.
 
 
-## Experimental disk-backed desktop save (2026-11-05; macOS gate pending)
+## Disk-backed desktop save (2026-11-05)
 
 The best-release patch adds opt-in apple-gfx-pci `save-state=on`. The default
 migration blocker remains for devices without the opt-in. The source must be
@@ -2046,9 +2046,9 @@ REV command. The restored command returned the same six emulated bytes; the
 process had no DRM descriptors. This qualifies only that emulated-device path.
 Four new mapper tests pass, including host-only byte reconstruction. The
 62 IOSurface fake-platform tests pass with test-threads=1; parallel log/call
-capture interference was retained separately. Full macOS/GPU save/restore,
-GPU pixels, application state, physical USB/audio and host-reboot restore
-remain unqualified. The installed daily build is unchanged by this candidate.
+capture interference was retained separately. The macOS and installed desktop
+checks below extend this initial device-only evidence; physical USB/audio and
+host-reboot restore remain unqualified.
 
 
 ### macOS saved-machine validation,2026-11-05
@@ -2078,3 +2078,21 @@ checks. Evidence and separate cleanup/identity receipts are retained under
 parent-workspace evidence/codex-20261105-disk-save. Original disk identities
 matched after clone cleanup. Physical USB/audio, host reboot restoration and
 automatic guest wall-clock resynchronization remain outside this proof.
+
+### Installed desktop entry validation
+
+The tested build was installed in the durable user-local bundle
+`~/.local/lib/reims-vgpu/saved-machine-20261105`, with launcher and offline
+stopped-disk backups under `~/reims-9070xt/launcher-backups/`.
+The actual Desktop entry, launched with `gio launch`, restored the production
+save in a new QEMU process. Guest boot, WindowServer and authored Cocoa fixture
+PIDs matched; text survived and further keyboard edits rendered correctly.
+The initial harness visual-check timeout was resumed against the same guest;
+its macOS cleanup command was corrected from an absent unlink executable to
+Perl's unlink. These were harness issues, not guest save/restore failures.
+After removing only the temporary fixture, another native X saved the normal
+machine to disk and stopped QEMU. See production-check.json and native captures
+in the parent workspace evidence directory for exact identities and outcomes.
+
+Keep the installed build and its matching saved image together. This test does
+not establish host-reboot restoration or guest wall-clock synchronization.

@@ -19,10 +19,16 @@ One paired video gap count regressed. Neither sustained 240 presents/s nor
 physical 240 Hz was qualified. These sources preserve a selected trade-off;
 they do not claim all-workload performance qualification.
 
-The window close-action property retains poweroff as QEMU's default and
-adds guest-cooperative powerdown and suspend. For the desktop, select
-powerdown if the guest refuses S3 (for example, SleepDisabled is enabled).
-Suspend retains RAM/GPU objects in the same process; apple-gfx migration
-is still blocked. The display's additive host window-state API marks a
-sleeping guest and restores/raises its window on wake. A successful source
-build or mock test does not qualify guest S3 or disk-state recovery.
+The desktop launcher uses `close-action=pause` and disk-backed saved-machine
+support. Closing the native window pauses the guest, saves RAM, GPU and device
+state to a private durable image, then exits QEMU. Opening the shortcut validates
+the matching build, configuration and disks before restoring the same session.
+A failed save resumes the source; an invalid saved image refuses an unsafe cold
+boot. The installed bundle must remain available while its saved images exist.
+
+The opt-in `apple-gfx-pci,save-state=on` path includes GPU and IOSurface state;
+ordinary migration remains blocked unless explicitly enabled. Repeated macOS
+native-close/shortcut cycles retained guest/app identity, editable text and
+rendered output. Injected commit-failure recovery was also checked. Host sleep
+uses a delay handler, with no blocking sleep inhibitor. Physical USB/audio,
+host-reboot restoration and guest clock synchronization remain unqualified.
