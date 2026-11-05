@@ -788,3 +788,22 @@ The API rests on these decisions.
 | 7 | How are a Metal device's capabilities covered, when a host cannot hand the library a device lacking them? | **Core's unit tests**: `device::tests::a_device_without_the_capabilities_leaves_them_out_of_device_info` turns off detach backing, the address-range heaps and buffers, IOSurface buffers, shared texture handles, dynamic stride, image blocks and command buffer jump, and `a_paravirtual_device_keeps_argument_buffers_off` names the device as a paravirtual GPU. |
 | 8 | Does an uncommitted frame that is released stay counted in flight, so that every later present waits its 2 s, as when a host of Apple's SDK drops an uncommitted command buffer? | **Yes**, and the header says so. Committing on release would change what a present waits for. |
 | 9 | Do the runner's `encode` records keep Metal's numeric command buffer status, or the API's status name? | **The name.** The runner records what the API answers. |
+
+
+### Experimental local-machine IOSurface snapshots
+
+`rvg_iosurface_device_save_machine_state` returns mapper state in `RvgBytes`,
+freed through `rvg_bytes_free`. The host stops CPUs and completes GPU
+`will_suspend`/`finish_suspend` before this call and before copying RAM.
+The mapper snapshot waits for its queue and refuses a non-drained ring.
+It saves the six registers, live mapping IDs and host-only surface bytes;
+guest-backed surface bytes belong to the host's RAM image.
+
+`rvg_iosurface_device_load_machine_state` runs over fully restored guest RAM,
+before GPU `did_resume` or any vCPU execution. Its local versioned format
+rejects a different page size, truncation, duplicate/invalid mapping IDs,
+excessive payloads and trailing bytes before changing registers. A later map
+failure may leave a partial incoming mapper; the host must abort that incoming
+VM without running it. GPU resources must be rebuilt only after mapper restore.
+A saved-machine parser is not permission to resume a different guest disk or
+GPU configuration. These additive APIs do not change ordinary MMIO behavior.

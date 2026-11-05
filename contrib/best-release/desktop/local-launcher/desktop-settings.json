@@ -9,5 +9,7 @@
   "close_action": "pause",
   "home_share": true,
   "clipboard": true,
-  "file_drop": true
+  "file_drop": true,
+  "disk_save": true,
+  "tsc_frequency_hz": 4699979000
 }

@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import time
+import struct
 
 ROOT = Path.home() / 'reims-9070xt'
 TITLE = 'macOS (Reims / RX 9070 XT)'
@@ -89,11 +90,14 @@ class QMP:
             raise RuntimeError('QMP sent an invalid response.')
         return reply
 
-    def command(self, command):
+    def command(self, command, arguments=None, timeout=None):
         sequence = self.sequence
         self.sequence += 1
-        self.connection.sendall((json.dumps({'execute': command, 'id': sequence}) + '\n').encode())
-        deadline = time.monotonic() + QMP_TIMEOUT
+        request = {'execute': command, 'id': sequence}
+        if arguments is not None:
+            request['arguments'] = arguments
+        self.connection.sendall((json.dumps(request) + '\n').encode())
+        deadline = time.monotonic() + (QMP_TIMEOUT if timeout is None else timeout)
         while True:
             reply = self._read(deadline)
             if 'event' in reply:
@@ -127,7 +131,58 @@ class QMP:
             time.sleep(0.1)
 
 
+def saved_session():
+    module = ROOT / 'saved-machine.py'
+    if not module.is_file():
+        return None
+    try:
+        run = current_run()
+    except FileNotFoundError:
+        return None
+    saved = runpy.run_path(str(module))
+    manifest = saved['read_saved'](run)
+    return (run, saved, manifest) if manifest else None
+
+
+def restore_loaded_session(run, saved):
+    with (run / 'saved-machine.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            notify('macOS is already restoring. Wait for it to finish.')
+            return
+        _restore_loaded_session(run, saved)
+
+
+def _restore_loaded_session(run, saved):
+    deadline = time.monotonic() + 180
+    while True:
+        try:
+            with QMP(run) as qmp:
+                status = qmp.status()
+                peer = struct.unpack('3i', qmp.connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                if status in ('paused', 'prelaunch'):
+                    saved['mark_restoring'](run, peer[0])
+                    qmp.command('cont', timeout=120)
+                    status = qmp.status()
+                if status == 'running':
+                    peer = struct.unpack('3i', qmp.connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                    saved['mark_restored'](run)
+                    control = runpy.run_path(str(ROOT / 'sleep-control.py'))
+                    control['window'](peer[0], 'show')
+                    notify('macOS restored from disk. Your session is retained.')
+                    return
+        except (FileNotFoundError, ConnectionRefusedError):
+            pass
+        if time.monotonic() > deadline:
+            raise RuntimeError('Restore did not finish; the saved image has been preserved.')
+        time.sleep(.2)
+
+
 def guest_state():
+    session = saved_session()
+    if session and session[2]['phase'] == 'saved' and session[1]['process_identity'](session[2]['source_pid']) != session[2].get('source_identity'):
+        return 'saved to disk'
     service = state()
     if service == 'active':
         with QMP(current_run()) as qmp:
@@ -138,6 +193,10 @@ def guest_state():
 def powerdown():
     service = state()
     if service not in ('active', 'activating'):
+        session = saved_session()
+        if session and session[2]['phase'] == 'saved':
+            notify('macOS is saved to disk. Restore it before requesting shutdown.')
+            return
         notify('macOS is stopped.')
         return
     if service == 'activating':
@@ -177,9 +236,32 @@ def main():
         if service == 'activating':
             notify('macOS is already starting.')
             return
-        if service == 'active':
-            control = runpy.run_path(str(ROOT / 'sleep-control.py'))
-            control['transition'](current_run(), 'resume')
+        session = saved_session()
+        restoring = session is not None and session[2]['phase'] in ('saved', 'restoring')
+        if service == 'active' and restoring:
+            command = json.loads((session[0] / 'command.json').read_text())
+            incoming = 'file:' + str(session[0] / session[2]['image'])
+            if any(option == '-incoming' and index + 1 < len(command) and command[index + 1] == incoming
+                   for index, option in enumerate(command)):
+                restore_loaded_session(session[0], session[1])
+                return
+            # Source cleanup owns the lifetime lease until every auxiliary has stopped.
+            deadline = time.monotonic() + 20
+            while state() == 'active' and time.monotonic() < deadline:
+                time.sleep(.2)
+            if state() == 'active':
+                notify('The saved session is finishing cleanup. Open again shortly.')
+                return
+        elif service == 'active':
+            run = current_run()
+            with (run / 'saved-machine.lock').open('a') as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    notify('macOS is saving to disk. Wait for saving to finish.')
+                    return
+                control = runpy.run_path(str(ROOT / 'sleep-control.py'))
+                control['transition'](run, 'resume')
             notify('macOS resumed. Your session is retained.')
             return
         with open('/var/tmp/reims-host-workload.lock', 'a') as lease:
@@ -190,7 +272,11 @@ def main():
             result = subprocess.run(['/usr/bin/python3', str(ROOT / 'launch.py')], capture_output=True, text=True)
         if result.returncode:
             raise RuntimeError(result.stderr.strip()[-600:] or 'The existing Reims launcher failed.')
-        notify('macOS is starting using the saved Reims build and display settings.')
+        if restoring:
+            notify('Restoring macOS RAM and devices from disk…')
+            restore_loaded_session(session[0], session[1])
+        else:
+            notify('macOS is starting using the saved Reims build and display settings.')
     else:
         raise RuntimeError('Usage: reims-macos [start|stop|status [--notify]|usb]')
 

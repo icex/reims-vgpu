@@ -1052,6 +1052,23 @@ uint64_t rvg_iosurface_device_mmio_read(RvgIOSurfaceDevice *device, uint64_t off
 // `device` is a live IOSurface device handle.
 void rvg_iosurface_device_mmio_write(RvgIOSurfaceDevice *device, uint64_t offset, uint64_t value);
 
+// Saves a mapper after CPUs are stopped and graphics finish_suspend has completed.
+// Includes registers, mapping IDs and host-only surface bytes. Free state with rvg_bytes_free.
+// May block on the mapper queue. No interrupt is raised. Refuses an undrained command ring.
+//
+// # Safety
+// device is NULL or live; state is NULL or writable. The host prevents all guest/device writes.
+RvgStatus rvg_iosurface_device_save_machine_state(RvgIOSurfaceDevice *device, RvgBytes *state);
+
+// Loads saved mapper state over restored RAM, before graphics did_resume and guest execution.
+// A refusal must abort incoming restore; no guest CPU may run with a partially restored mapper.
+//
+// # Safety
+// device is NULL or live; state holds length bytes or is NULL. All guest/device writers stopped.
+RvgStatus rvg_iosurface_device_load_machine_state(RvgIOSurfaceDevice *device,
+                                                  const uint8_t *state,
+                                                  size_t length);
+
 // Tells the device the guest wrote `dirty`, inside a range add_trace_range watches. Any thread,
 // except inside add_trace_range. NULL does nothing.
 //

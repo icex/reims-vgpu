@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 
 ROOT = Path(__file__).resolve().parent
@@ -40,9 +41,9 @@ def main():
     if channel == 'best' and close_action not in ('pause', 'suspend', 'powerdown'):
         parser.error('close_action must be pause, suspend or powerdown')
     build, dist, manifest = {
-        'best': (Path('/home/bogdan/.cache/reims-sleep-20261105/bundle/bin'),
-            Path('/home/bogdan/.cache/reims-sleep-20261105/bundle'),
-            '/home/bogdan/.cache/reims-sleep-20261105/bundle/manifest.json'),
+        'best': (Path('/home/bogdan/.cache/reims-disk-save-20261105/bundle/bin'),
+            Path('/home/bogdan/.cache/reims-disk-save-20261105/bundle'),
+            '/home/bogdan/.cache/reims-disk-save-20261105/bundle/manifest.json'),
         'daily': (Path('/home/bogdan/.cache/reims-proven-fixes-20261024/bundle/bin'),
             Path('/home/bogdan/.cache/reims-proven-fixes-20261024/bundle'),
             '/home/bogdan/.cache/reims-proven-fixes-20261024/bundle/manifest.json'),
@@ -102,6 +103,8 @@ def main():
         addr='0x6', romfile=str(rom), resolution=resolution)
     if close_action is not None:
         gpu_device['close-action'] = close_action
+        if settings.get('disk_save'):
+            gpu_device['save-state'] = True
     if match:
         width, height = int(match[1]), int(match[2])
         sizes = dict.fromkeys([(width, height), (3840,2160), (2560,1600),
@@ -117,10 +120,16 @@ def main():
             if w <= width and h <= height for hz in rates]
         gpu_device['display-modes'] += [f'{w}x{h}@{hz}' for w,h in large
             if (w, h) not in sizes or w > width or h > height for hz in rates]
+    cpu_model = 'Haswell-noTSX,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on'
+    if settings.get('disk_save'):
+        frequency = settings.get('tsc_frequency_hz')
+        if type(frequency) is not int or frequency <= 0 or frequency % 1000:
+            parser.error('disk_save requires a measured integer tsc_frequency_hz in whole kHz')
+        cpu_model += f',tsc-frequency={frequency}'
     args = [str(qemu), '-L', '/usr/share/qemu', '-name', 'Reims macOS - RX 9070 XT', '-enable-kvm', '-m', f'{ram_gb}G',
         '-object', f'memory-backend-memfd,id=reims-ram,size={ram_gb}G,share=on',
         '-machine', 'q35,memory-backend=reims-ram',
-        '-cpu', 'Haswell-noTSX,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on',
+        '-cpu', cpu_model,
         '-smp', f'{vcpus},sockets=1,cores={vcpus},threads=1',
         '-device', 'qemu-xhci,id=xhci', '-global', 'qemu-xhci.p2=8', '-global', 'qemu-xhci.p3=8',
         '-device', 'usb-kbd,bus=xhci.0', '-device', 'usb-tablet,bus=xhci.0',
@@ -148,8 +157,6 @@ def main():
     for slot in range(2):
         args += ['-chardev', f'socket,id=reims_usbredir{slot},path={run}/usbredir-{slot}.sock,server=on,wait=off',
                  '-device', f'usb-redir,id=reims_usbredir_dev{slot},chardev=reims_usbredir{slot},bus=xhci.0']
-    if not options.dry_run:
-        (run / 'command.json').write_text(json.dumps(args, indent=2) + '\n')
     if channel in ('candidate', 'test', 'daily', 'best'):
         # The native window shows every frame; SPICE (clipboard only) needs no live console copy.
         gpu_device['window-readback-interval'] = int(os.environ.get('REIMS_READBACK_MS', '600000'))
@@ -159,14 +166,17 @@ def main():
     if channel in ('development', 'candidate', 'test', 'daily', 'best'):
         index = args.index('-device', args.index('-vga'))
         args[index + 2:index + 2] = ['-device', json.dumps(dict(driver='apple-gfx-iosurface-pci',bus='pcie.0',addr='0x7'))]
-        if not options.dry_run:
-            (run / 'command.json').write_text(json.dumps(args, indent=2) + '\n')
     if close_action == 'suspend':
         # Advertise an ACPI guest sleep button only for the suspend policy.
         args += ['-global', 'ICH9-LPC.x-sleep-button=on']
     if halt_poll_ns is not None:
         index = args.index('-enable-kvm')
         args[index:index + 1] = ['-accel', f'kvm,halt-poll-ns={halt_poll_ns}']
+    if settings.get('disk_save'):
+        saved = runpy.run_path(str(ROOT / 'saved-machine.py'))
+        incoming = saved['validate_restore'](run, args)
+        if incoming is not None:
+            args += ['-S', '-incoming', 'file:' + str(incoming)]
     if not options.dry_run:
         (run / 'command.json').write_text(json.dumps(args, indent=2) + '\n')
         (run / 'latest-build.json').write_text(manifest.read_text())

@@ -101,6 +101,16 @@ impl<P: Platform> IoSurfaceDevice<P> {
         &self.inner
     }
 
+    /// Saves a mapper after CPUs and graphics tasks are quiesced, including host-only bytes.
+    pub fn save_machine_state(&self) -> Result<Vec<u8>, String> {
+        entry::run(|_| self.inner.save_machine_state())
+    }
+
+    /// Restores the mapper over loaded guest RAM before graphics tasks or CPUs resume.
+    pub fn load_machine_state(&self, bytes: &[u8]) -> Result<(), String> {
+        entry::run(|_| self.inner.load_machine_state(bytes))
+    }
+
     /// A 64-bit read at `offset` in the device's registers (0x1000 to 0x1030); an offset that
     /// names no register reads all ones.
     pub fn mmio_read(&self, offset: u64) -> u64 {

@@ -33,6 +33,7 @@ pub mod descriptor;
 mod device;
 mod regs;
 mod ring;
+mod snapshot;
 mod table;
 #[cfg(test)]
 mod testing;
@@ -71,6 +72,10 @@ pub enum DeathKind {
     PageTableRead,
     /// The test pattern written into a surface.
     PatternWrite,
+    /// Host-only bytes read for a saved machine.
+    SnapshotRead,
+    /// Host-only bytes restored into a new machine.
+    SnapshotWrite,
     /// A descriptor page index past the device's page slots (a VM page above 16 KiB).
     PageIndex,
     /// Interrupt 0 raised with no interrupt block.
@@ -95,6 +100,8 @@ impl DeathKind {
             DeathKind::MappedBitClear => "iosurface.descriptor.mapped_clear",
             DeathKind::PageTableRead => "iosurface.walk.read",
             DeathKind::PatternWrite => "iosurface.test.write",
+            DeathKind::SnapshotRead => "iosurface.snapshot.read",
+            DeathKind::SnapshotWrite => "iosurface.snapshot.write",
             DeathKind::PageIndex => "iosurface.table.page_index",
             DeathKind::NoInterrupt => "iosurface.interrupt.nil",
             DeathKind::FreedInterrupt => "iosurface.interrupt.freed",

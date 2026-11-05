@@ -1,4 +1,39 @@
-# Local desktop RAM pause and host sleep
+# Local desktop saved machines, RAM pause and host sleep
+
+## Disk-backed saved-machine candidate — not yet qualified or installed
+
+The user's requested X behavior is a full machine save to SSD/HDD followed by
+QEMU exit, with the same session restored by the shortcut. RAM pause is only
+the earlier installed interim behavior; it does not satisfy that requirement.
+
+The experimental `disk_save: true` launcher setting enables apple-gfx
+`save-state=on` and passes `--disk-save` to the companion. It flushes and tears
+down GPU tasks before QEMU copies RAM, saves the GPU blob and IOSurface mapper
+mapping IDs/host-only bytes, and includes USB audio and AppleSMC device state.
+The normal host-sleep policy still permits host suspend and never holds a
+blocking sleep inhibitor.
+
+`saved-machine.py` writes a private image, waits for migration completion,
+fsyncs the image and manifest, then exits the bound QEMU process. A failure
+before durable commit never sends quit. The shortcut validates the image hash,
+exact QEMU build/configuration and unchanged disk identities before starting
+`-incoming`; a changed or incomplete save never falls back to a cold boot.
+Interrupted restore is recorded explicitly before CPUs resume. Saved images
+contain guest RAM and stay private to the owning account.
+
+Candidate checks:4 mapper roundtrip/parser tests;62 IOSurface tests serially;
+14 transaction/failure tests; stopped64MiB QEMU save/exit/restore with USB audio
+and a partially completed AppleSMC command, with no GPU access. Library and
+QEMU builds and library/API clippy pass. These do NOT prove macOS/GPU recovery.
+The healthy daily guest is preserved pending user approval to shut it down
+for an isolated macOS save/restore roundtrip. Do not promote this candidate
+until its desktop, unsaved state, input, disk pairing and failure recovery pass.
+
+The exact local candidate launcher is under `local-launcher/`; its cache paths
+are this host's. See `evidence/codex-20261105-disk-save/` in the parent workspace.
+
+## Earlier installed RAM-only policy
+
 
 The desktop shortcut starts macOS or resumes its retained RAM session.
 Native window X selects QEMU `close-action=pause`: QEMU pauses its CPUs,

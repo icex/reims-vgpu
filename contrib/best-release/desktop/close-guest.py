@@ -9,6 +9,9 @@ import signal
 import sys
 import threading
 import time
+import runpy
+import struct
+import socket
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -21,6 +24,7 @@ def module(name, path):
 
 control = module('sleep_control', HERE / 'sleep-control.py')
 legacy = module('close_events', HERE / 'close-events.py')
+saved = module('saved_machine', HERE / 'saved-machine.py')
 
 
 class HostSleep:
@@ -32,6 +36,7 @@ class HostSleep:
         self.loop = GLib.MainLoop()
         self.run = run
         self.resume_after_host = False
+        self.saving = False
         self.fd = None
         self.bus = dbus.SystemBus()
         self.manager = dbus.Interface(self.bus.get_object('org.freedesktop.login1', '/org/freedesktop/login1'),
@@ -54,7 +59,10 @@ class HostSleep:
 
     def prepare(self, sleeping):
         try:
-            if sleeping:
+            if sleeping and self.saving:
+                self.resume_after_host = False
+                legacy.record('host-sleep-during-disk-save', guest_already_paused=True)
+            elif sleeping:
                 result = control.transition(self.run, 'pause', manage_window=False)
                 self.resume_after_host = result['before'] == 'running'
                 legacy.record('host-sleep-paused', **result)
@@ -85,6 +93,7 @@ def main():
     parser.add_argument('--disk', type=Path)
     parser.add_argument('--ssh-port', type=int, required=True) # supervisor compatibility; no guest SSH
     parser.add_argument('--ssh-key', type=Path)
+    parser.add_argument('--disk-save', action='store_true')
     opts = parser.parse_args()
     run = opts.run.resolve(strict=True)
     stopped = threading.Event()
@@ -113,8 +122,27 @@ def main():
                 if 0 <= time.time() - requested < 15:
                     shutdown.event(event)
                     continue
-                legacy.record('native-close-paused', **control.transition(run, 'pause'))
-                legacy.notify('macOS paused in RAM. Open the desktop shortcut to resume. Keep the host powered on.')
+                if opts.disk_save:
+                    api = runpy.run_path(str(control.ICON))
+                    try:
+                        with api['QMP'](run) as qmp:
+                            peer = struct.unpack('3i', qmp.connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                            legacy.validate_identity(run, opts.pid, opts.executable, peer, disk=opts.disk)
+                            if qmp.status() != 'paused':
+                                legacy.record('stale-native-close-ignored', state=qmp.status())
+                                continue
+                            host.saving = True
+                            result = saved.save(run, qmp, opts.pid, legacy.notify)
+                            legacy.record('native-close-saved-to-disk', image=result['image'], bytes=result['image_size'])
+                        break
+                    except Exception as error:
+                        legacy.record('disk-save-error', error=repr(error))
+                        legacy.notify('Disk save needs attention: ' + str(error) + '. Any committed saved image is preserved.')
+                    finally:
+                        host.saving = False
+                else:
+                    legacy.record('native-close-paused', **control.transition(run, 'pause'))
+                    legacy.notify('macOS paused in RAM. Open the desktop shortcut to resume. Keep the host powered on.')
     except EOFError:
         pass
     finally:

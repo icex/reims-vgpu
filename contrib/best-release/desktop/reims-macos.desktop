@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=macOS (Reims / RX 9070 XT)
-Comment=Close pauses macOS in RAM; reopen to resume the same session
+Comment=Save macOS RAM and devices to disk on close; reopen to restore
 Exec=/home/bogdan/.local/bin/reims-macos
 Icon=computer
 Terminal=false

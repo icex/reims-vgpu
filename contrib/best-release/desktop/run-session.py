@@ -33,9 +33,17 @@ def close_helper_args(run, args):
     helper = Path(__file__).with_name('close-guest.py')
     if not helper.is_file():
         raise RuntimeError('The Reims clean-close helper is missing; the VM was not started.')
-    return [sys.executable, '-B', str(helper), '--run', str(run),
-            '--executable', args[0], '--disk', disks[0], '--ssh-port', ports[0],
-            '--ssh-key', str(Path.home() / 'macos-vm/vmkey')]
+    command = [sys.executable, '-B', str(helper), '--run', str(run),
+               '--executable', args[0], '--disk', disks[0], '--ssh-port', ports[0],
+               '--ssh-key', str(Path.home() / 'macos-vm/vmkey')]
+    for index, arg in enumerate(args[:-1]):
+        if arg == '-device' and args[index + 1].startswith('{'):
+            device = json.loads(args[index + 1])
+            if device.get('driver') == 'apple-gfx-pci' and device.get('save-state') is True:
+                if not helper.with_name('saved-machine.py').is_file():
+                    raise RuntimeError('The disk-save controller is missing; VM was not started.')
+                command.append('--disk-save')
+    return command
 
 
 def stop_close_helper(child):

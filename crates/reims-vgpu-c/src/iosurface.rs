@@ -189,3 +189,73 @@ pub unsafe extern "C" fn rvg_iosurface_device_mmio_write(
 
 #[cfg(test)]
 mod tests;
+
+/// Saves a mapper after CPUs are stopped and graphics finish_suspend has completed.
+/// Includes registers, mapping IDs and host-only surface bytes. Free state with rvg_bytes_free.
+/// May block on the mapper queue. No interrupt is raised. Refuses an undrained command ring.
+///
+/// # Safety
+/// device is NULL or live; state is NULL or writable. The host prevents all guest/device writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_iosurface_device_save_machine_state(
+    device: *mut RvgIOSurfaceDevice,
+    state: *mut crate::device::RvgBytes,
+) -> RvgStatus {
+    ffi::export(|| {
+        // SAFETY: caller's handle contract.
+        let Some(d) = (unsafe { handle::get(device) }) else {
+            return RVG_ERR_INVALID_ARGUMENT;
+        };
+        if state.is_null() {
+            return RVG_ERR_INVALID_ARGUMENT;
+        }
+        match d.device.save_machine_state() {
+            Ok(bytes) => {
+                let bytes = Box::into_raw(bytes.into_boxed_slice());
+                // SAFETY: output checked non-NULL; caller guarantees writable storage.
+                unsafe {
+                    state.write(crate::device::RvgBytes {
+                        data: bytes.cast::<u8>(),
+                        length: bytes.len(),
+                    })
+                };
+                RVG_OK
+            }
+            Err(error) => {
+                log::error!("cannot save mapper: {error}");
+                crate::status::RVG_ERR_SUSPEND
+            }
+        }
+    })
+}
+
+/// Loads saved mapper state over restored RAM, before graphics did_resume and guest execution.
+/// A refusal must abort incoming restore; no guest CPU may run with a partially restored mapper.
+///
+/// # Safety
+/// device is NULL or live; state holds length bytes or is NULL. All guest/device writers stopped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_iosurface_device_load_machine_state(
+    device: *mut RvgIOSurfaceDevice,
+    state: *const u8,
+    length: usize,
+) -> RvgStatus {
+    ffi::export(|| {
+        // SAFETY: caller's handle contract.
+        let Some(d) = (unsafe { handle::get(device) }) else {
+            return RVG_ERR_INVALID_ARGUMENT;
+        };
+        if state.is_null() {
+            return RVG_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: caller guarantees length readable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(state, length) };
+        match d.device.load_machine_state(bytes) {
+            Ok(()) => RVG_OK,
+            Err(error) => {
+                log::error!("cannot restore mapper: {error}");
+                crate::status::RVG_ERR_RESUME
+            }
+        }
+    })
+}

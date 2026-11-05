@@ -1,0 +1,2 @@
+# Unified diff context uses a literal space on otherwise empty lines.
+contrib/best-release/*.patch whitespace=-blank-at-eol

@@ -1,5 +1,306 @@
+diff --git a/hw/display/apple-gfx-pci.c b/hw/display/apple-gfx-pci.c
+index 1dede8993c..c93407b1d1 100644
+--- a/hw/display/apple-gfx-pci.c
++++ b/hw/display/apple-gfx-pci.c
+@@ -24,6 +24,13 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
++#include "qemu/units.h"
++#include "qemu/error-report.h"
++#include "qemu/aio-wait.h"
++#include "migration/misc.h"
++#include "migration/vmstate.h"
++#include "migration/qemu-file.h"
++#include "system/runstate.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/timer.h"
+ #include "system/address-spaces.h"
+@@ -39,6 +46,11 @@ struct AppleGFXPCIState {
+     PCIDevice parent_obj;
+ 
+     AppleGFXState common;
++    uint8_t *saved_gpu, *saved_mapper;
++    uint32_t saved_gpu_size, saved_mapper_size;
++    bool saved_pending, saved_accepted, saved_registered;
++    NotifierWithReturn saved_notifier;
++    VMChangeStateEntry *saved_vm_handler;
+     bool efi_fb_bar;
+     MemoryRegion efi_fb_bar_mr; /* BAR 2 */
+     MemoryRegion efi_fb; /* in BAR 2: an alias of the machine's RAM */
+@@ -52,6 +64,187 @@ struct AppleGFXPCIState {
+ #define APPLE_GFX_PCI_PAGE_SHIFT 14
+ #endif
+ 
++/* Opt-in stopped-machine save. The migration setup notifier runs before RAM
++ * transfer, so the library's final GPU writebacks are included in that RAM. */
++static void apple_gfx_saved_clear(AppleGFXPCIState *s)
++{
++    g_clear_pointer(&s->saved_gpu, g_free);
++    g_clear_pointer(&s->saved_mapper, g_free);
++    s->saved_gpu_size = s->saved_mapper_size = 0;
++    s->saved_pending = s->saved_accepted = false;
++}
++
++static bool apple_gfx_saved_accept(AppleGFXPCIState *s, Error **errp)
++{
++    RvgResumeError reason = RVG_RESUME_ERROR_NONE;
++    RvgStatus status = rvg_device_will_resume(s->common.pgdev, s->saved_gpu,
++                                              s->saved_gpu_size, &reason);
++    if (status != RVG_OK) {
++        error_setg(errp, "apple-gfx: saved GPU state refused: %s (reason %u)",
++                   rvg_status_message(status), reason);
++        return false;
++    }
++    s->saved_accepted = true;
++    return true;
++}
++
++static void apple_gfx_saved_vm_state(void *opaque, bool running, RunState state)
++{
++    AppleGFXPCIState *s = opaque;
++    if (!running || !s->saved_pending) {
++        return;
++    }
++    /* VM change handlers run before resume_all_vcpus(). */
++    if (!s->saved_accepted && !apple_gfx_saved_accept(s, &error_fatal)) {
++        return;
++    }
++    rvg_device_did_resume(s->common.pgdev);
++    apple_gfx_saved_clear(s);
++}
++
++static int apple_gfx_saved_migration(NotifierWithReturn *notify,
++                                      MigrationEvent *event, Error **errp)
++{
++    AppleGFXPCIState *s = container_of(notify, AppleGFXPCIState, saved_notifier);
++    RvgBytes bytes = { 0 };
++    RvgStatus status;
++    unsigned int i;
++
++    if (event->type != MIG_EVENT_SETUP) {
++        return 0;
++    }
++    if (runstate_is_running() || s->common.suspended) {
++        error_setg(errp, "apple-gfx: disk save requires a stopped VM, outside guest S3");
++        return -EINVAL;
++    }
++    if (s->saved_pending) {
++        error_setg(errp, "apple-gfx: resume or discard the preceding save first");
++        return -EBUSY;
++    }
++    /* Drain readbacks before tearing down the GPU tasks they read from. */
++    for (i = 0; i < s->common.num_displays; i++) {
++        AIO_WAIT_WHILE(NULL, s->common.displays[i].rendering);
++    }
++    rvg_device_will_suspend(s->common.pgdev);
++    status = rvg_device_finish_suspend(s->common.pgdev, &bytes);
++    if (status != RVG_OK) {
++        error_setg(errp, "apple-gfx: cannot suspend GPU: %s", rvg_status_message(status));
++        return -EIO;
++    }
++    if (bytes.length > 16 * MiB) {
++        rvg_bytes_free(bytes);
++        error_setg(errp, "apple-gfx: oversized GPU suspend state");
++        return -EOVERFLOW;
++    }
++    s->saved_gpu_size = bytes.length;
++    s->saved_gpu = g_memdup2(bytes.data, bytes.length);
++    rvg_bytes_free(bytes);
++    s->saved_pending = true; /* cont can recover even if mapper serialization fails. */
++    if (s->common.pgmapper) {
++        bytes = (RvgBytes) { 0 };
++        status = rvg_iosurface_device_save_machine_state(s->common.pgmapper, &bytes);
++        if (status != RVG_OK) {
++            error_setg(errp, "apple-gfx: cannot save IOSurface mapper: %s", rvg_status_message(status));
++            return -EIO;
++        }
++        if (bytes.length > GiB + MiB) {
++            rvg_bytes_free(bytes);
++            error_setg(errp, "apple-gfx: oversized IOSurface suspend state");
++            return -EOVERFLOW;
++        }
++        s->saved_mapper_size = bytes.length;
++        s->saved_mapper = g_memdup2(bytes.data, bytes.length);
++        rvg_bytes_free(bytes);
++    }
++    return 0;
++}
++
++static int apple_gfx_saved_put(QEMUFile *f, void *opaque, size_t size,
++                                const VMStateField *field, JSONWriter *vmdesc)
++{
++    AppleGFXPCIState *s = opaque;
++    if (!s->saved_pending || !s->saved_gpu_size) {
++        return -EINVAL;
++    }
++    qemu_put_be32(f, s->saved_gpu_size);
++    qemu_put_buffer(f, s->saved_gpu, s->saved_gpu_size);
++    qemu_put_be32(f, s->saved_mapper_size);
++    qemu_put_buffer(f, s->saved_mapper, s->saved_mapper_size);
++    return qemu_file_get_error(f);
++}
++
++static int apple_gfx_saved_get(QEMUFile *f, void *opaque, size_t size,
++                                const VMStateField *field)
++{
++    AppleGFXPCIState *s = opaque;
++    if (!s->common.save_state) {
++        return -ENOTSUP;
++    }
++    apple_gfx_saved_clear(s);
++    s->saved_gpu_size = qemu_get_be32(f);
++    if (!s->saved_gpu_size || s->saved_gpu_size > 16 * MiB) {
++        return -EINVAL;
++    }
++    s->saved_gpu = g_malloc(s->saved_gpu_size);
++    if (qemu_get_buffer(f, s->saved_gpu, s->saved_gpu_size) != s->saved_gpu_size) {
++        return -EIO;
++    }
++    s->saved_mapper_size = qemu_get_be32(f);
++    if (s->saved_mapper_size > GiB + MiB ||
++        (!!s->saved_mapper_size != !!s->common.pgmapper)) {
++        return -EINVAL;
++    }
++    if (s->saved_mapper_size) {
++        s->saved_mapper = g_malloc(s->saved_mapper_size);
++        if (qemu_get_buffer(f, s->saved_mapper, s->saved_mapper_size) != s->saved_mapper_size) {
++            return -EIO;
++        }
++    }
++    return qemu_file_get_error(f);
++}
++
++static int apple_gfx_saved_post_load(void *opaque, int version)
++{
++    AppleGFXPCIState *s = opaque;
++    if (s->common.pgmapper &&
++        rvg_iosurface_device_load_machine_state(s->common.pgmapper,
++               s->saved_mapper, s->saved_mapper_size) != RVG_OK) {
++        return -EINVAL;
++    }
++    if (!apple_gfx_saved_accept(s, NULL)) {
++        return -EINVAL;
++    }
++    s->saved_pending = true;
++    /* EFI BAR2 alias is derived from restored GPU registers, not a saved host pointer. */
++    if (s->common.mmio_written) {
++        uint32_t enabled = rvg_device_mmio_read(s->common.pgdev, 0x1210);
++        s->common.mmio_written(&s->common, 0x1210, enabled);
++    }
++    return 0;
++}
++
++static const VMStateDescription vmstate_apple_gfx_pci = {
++    .name = "apple-gfx-pci",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = apple_gfx_saved_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_PCI_DEVICE(parent_obj, AppleGFXPCIState),
++        VMSTATE_UINT32(common.input_buttons, AppleGFXPCIState),
++        {
++            .name = "gpu-and-iosurface",
++            .info = &(const VMStateInfo) {
++                .name = "apple-gfx-stopped-machine",
++                .get = apple_gfx_saved_get,
++                .put = apple_gfx_saved_put,
++            },
++            .flags = VMS_SINGLE,
++            .offset = 0,
++        },
++        VMSTATE_END_OF_LIST()
++    },
++};
++
+ static void apple_gfx_pci_init(Object *obj)
+ {
+     AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
+@@ -63,6 +256,11 @@ static void apple_gfx_pci_finalize(Object *obj)
+ {
+     AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
+ 
++    if (s->saved_registered) {
++        migration_remove_notifier(&s->saved_notifier);
++        qemu_del_vm_change_state_handler(s->saved_vm_handler);
++    }
++    apple_gfx_saved_clear(s);
+     apple_gfx_common_finalize(&s->common);
+ }
+ 
+@@ -260,6 +458,12 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
+         /* Validation failed before the library accepted the callback table. */
+         apple_gfx_pci_irq_destroy(irq);
+     }
++    if (s->common.save_state && s->common.pgdev) {
++        migration_add_notifier(&s->saved_notifier, apple_gfx_saved_migration);
++        s->saved_vm_handler = qemu_add_vm_change_state_handler(apple_gfx_saved_vm_state, s);
++        s->saved_registered = true;
++    }
++
+ }
+ 
+ static void apple_gfx_pci_reset(Object *obj, ResetType type)
+@@ -298,6 +502,7 @@ static const Property apple_gfx_pci_properties[] = {
+      */
+     DEFINE_PROP_STRING("resolution", AppleGFXPCIState, common.resolution),
+     DEFINE_PROP_STRING("close-action", AppleGFXPCIState, common.close_action),
++    DEFINE_PROP_BOOL("save-state", AppleGFXPCIState, common.save_state, false),
+     /*
+      * With a window, the least milliseconds between two reads of a frame
+      * back into QEMU's console surface (a SPICE or VNC listener's, a
+@@ -317,6 +522,7 @@ static void apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
+ 
+     rc->phases.hold = apple_gfx_pci_reset;
+     dc->desc = "macOS Paravirtualized Graphics PCI Display Controller";
++    dc->vmsd = &vmstate_apple_gfx_pci;
+     dc->hotpluggable = false;
+     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+ 
+@@ -451,6 +657,7 @@ static void apple_gfx_iosurface_pci_realize(PCIDevice *dev, Error **errp)
+                        TYPE_APPLE_GFX_IOSURFACE_PCI);
+             return;
+         }
++        s->gpu = APPLE_GFX_PCI(gpu);
+     }
+     /*
+      * apple-gfx-pci maps through the process's latest IOSurface device, so a
+@@ -486,6 +693,8 @@ static void apple_gfx_iosurface_pci_realize(PCIDevice *dev, Error **errp)
+         error_setg(errp, "%s: rvg_iosurface_device_create: %s",
+                    TYPE_APPLE_GFX_IOSURFACE_PCI, rvg_status_message(status));
+         msi_uninit(dev);
++    } else {
++        s->gpu->common.pgmapper = s->pgiosfc;
+     }
+ }
+ 
+@@ -538,6 +747,16 @@ static const Property apple_gfx_iosurface_pci_properties[] = {
+                      AppleGFXPCIState *),
+ };
+ 
++static const VMStateDescription vmstate_apple_gfx_iosurface_pci = {
++    .name = "apple-gfx-iosurface-pci",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_PCI_DEVICE(parent_obj, AppleGFXIOSurfacePCIState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
+ static void apple_gfx_iosurface_pci_class_init(ObjectClass *klass,
+                                                const void *data)
+ {
+@@ -546,6 +765,7 @@ static void apple_gfx_iosurface_pci_class_init(ObjectClass *klass,
+     ResettableClass *rc = RESETTABLE_CLASS(klass);
+ 
+     dc->desc = "macOS Paravirtualized Graphics IOSurface Mapper";
++    dc->vmsd = &vmstate_apple_gfx_iosurface_pci;
+     rc->phases.hold = apple_gfx_iosurface_pci_reset;
+     dc->hotpluggable = false;
+     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 diff --git a/hw/display/apple-gfx.c b/hw/display/apple-gfx.c
-index e5e1a692bd..1fcf75bbb9 100644
+index e5e1a692bd..07aab04d3a 100644
 --- a/hw/display/apple-gfx.c
 +++ b/hw/display/apple-gfx.c
 @@ -22,6 +22,7 @@
@@ -45,6 +346,175 @@ index e5e1a692bd..1fcf75bbb9 100644
          return false;
      }
      if (s->num_displays < 1 || s->num_displays > RVG_MAX_DISPLAY_PORTS) {
+@@ -1133,7 +1143,7 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
+         return false;
+     }
+ 
+-    if (apple_gfx_mig_blocker == NULL) {
++    if (!s->save_state && apple_gfx_mig_blocker == NULL) {
+         error_setg(&apple_gfx_mig_blocker,
+                   "Migration state blocked by apple-gfx display device");
+         if (migrate_add_blocker(&apple_gfx_mig_blocker, errp) < 0) {
+diff --git a/hw/display/apple-gfx.h b/hw/display/apple-gfx.h
+index ae78bb8501..c35640c1a1 100644
+--- a/hw/display/apple-gfx.h
++++ b/hw/display/apple-gfx.h
+@@ -61,6 +61,8 @@ struct AppleGFXState {
+     /* Initialised on init/realize() */
+     MemoryRegion iomem_gfx;
+     RvgDevice *pgdev;
++    RvgIOSurfaceDevice *pgmapper; /* borrowed from the PCI mapper */
++    bool save_state; /* explicit opt-in to stopped-machine migration */
+     /* This realization passed the valid host callback table to the library. */
+     bool host_callbacks_submitted;
+     /* Called after the library takes a guest write; may take the BQL */
+diff --git a/hw/misc/applesmc.c b/hw/misc/applesmc.c
+index 84bcf4df0a..0f7df79a93 100644
+--- a/hw/misc/applesmc.c
++++ b/hw/misc/applesmc.c
+@@ -31,6 +31,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "migration/vmstate.h"
+ #include "hw/isa/isa.h"
+ #include "hw/core/qdev-properties.h"
+ #include "ui/console.h"
+@@ -407,6 +408,26 @@ static void build_applesmc_aml(AcpiDevAmlIf *adev, Aml *scope)
+     aml_append(scope, dev);
+ }
+ 
++/* Immutable keys are constructed by realize from the pinned configuration.
++ * Preserve a command in progress, including its partially read key/data. */
++static const VMStateDescription vmstate_applesmc = {
++    .name = "applesmc",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT8(cmd, AppleSMCState),
++        VMSTATE_UINT8(status, AppleSMCState),
++        VMSTATE_UINT8(status_1e, AppleSMCState),
++        VMSTATE_UINT8(last_ret, AppleSMCState),
++        VMSTATE_BUFFER_UNSAFE(key, AppleSMCState, 0, 4),
++        VMSTATE_UINT8(read_pos, AppleSMCState),
++        VMSTATE_UINT8(data_len, AppleSMCState),
++        VMSTATE_UINT8(data_pos, AppleSMCState),
++        VMSTATE_BUFFER(data, AppleSMCState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
+ static void qdev_applesmc_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -415,6 +436,7 @@ static void qdev_applesmc_class_init(ObjectClass *klass, const void *data)
+     dc->realize = applesmc_isa_realize;
+     dc->unrealize = applesmc_unrealize;
+     device_class_set_legacy_reset(dc, qdev_applesmc_isa_reset);
++    dc->vmsd = &vmstate_applesmc;
+     device_class_set_props(dc, applesmc_isa_properties);
+     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+     adevc->build_dev_aml = build_applesmc_aml;
+diff --git a/hw/usb/dev-audio.c b/hw/usb/dev-audio.c
+index b10fb3d2b5..5a6bda105b 100644
+--- a/hw/usb/dev-audio.c
++++ b/hw/usb/dev-audio.c
+@@ -34,6 +34,7 @@
+ #include "hw/core/qdev-properties.h"
+ #include "hw/usb/usb.h"
+ #include "migration/vmstate.h"
++#include "migration/qemu-file.h"
+ #include "desc.h"
+ #include "qemu/audio.h"
+ #include "qom/object.h"
+@@ -1011,11 +1012,86 @@ static void usb_audio_reinit(USBDevice *dev, unsigned channels)
+     audio_be_set_active_out(s->audio_be, s->out.voice, 0);
+ }
+ 
++/* Preserve USB protocol state, volume and queued PCM across a stopped-machine
++ * save. Host audio handles are reopened; only initialized pending bytes move. */
++static int usb_audio_saved_put(QEMUFile *f, void *opaque, size_t size,
++                                const VMStateField *field, JSONWriter *vmdesc)
++{
++    USBAudioState *s = opaque;
++    uint64_t used = s->out.buf.prod - s->out.buf.cons;
++    size_t offset, first;
++    if (used > s->out.buf.size || used > 16 * 1024 * 1024) {
++        return -EINVAL;
++    }
++    qemu_put_be32(f, s->out.altset);
++    qemu_put_be32(f, s->out.channels);
++    qemu_put_byte(f, s->out.vol.mute);
++    qemu_put_buffer(f, s->out.vol.vol, AUDIO_MAX_CHANNELS);
++    qemu_put_be32(f, used);
++    if (used) {
++        offset = s->out.buf.cons % s->out.buf.size;
++        first = MIN(used, s->out.buf.size - offset);
++        qemu_put_buffer(f, s->out.buf.data + offset, first);
++        qemu_put_buffer(f, s->out.buf.data, used - first);
++    }
++    return qemu_file_get_error(f);
++}
++
++static int usb_audio_saved_get(QEMUFile *f, void *opaque, size_t size,
++                                const VMStateField *field)
++{
++    USBAudioState *s = opaque;
++    uint32_t altset = qemu_get_be32(f), channels = qemu_get_be32(f);
++    bool mute = qemu_get_byte(f);
++    uint8_t volume[AUDIO_MAX_CHANNELS];
++    uint32_t used;
++    if (qemu_get_buffer(f, volume, sizeof(volume)) != sizeof(volume)) {
++        return -EIO;
++    }
++    used = qemu_get_be32(f);
++    if (altset > ALTSET_71 ||
++        (channels != 2 && channels != 6 && channels != 8) ||
++        (!s->multi && channels != 2) ||
++        (altset && altset_channels[altset] != channels) ||
++        used > 16 * 1024 * 1024) {
++        return -EINVAL;
++    }
++    usb_audio_reinit(USB_DEVICE(s), channels);
++    if (usb_audio_set_output_altset(s, altset) < 0 || used > s->out.buf.size) {
++        return -EINVAL;
++    }
++    s->out.vol.mute = mute;
++    memcpy(s->out.vol.vol, volume, sizeof(volume));
++    audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
++    if (qemu_get_buffer(f, s->out.buf.data, used) != used) {
++        return -EIO;
++    }
++    s->out.buf.cons = 0;
++    s->out.buf.prod = used;
++    return qemu_file_get_error(f);
++}
++
+ static const VMStateDescription vmstate_usb_audio = {
+     .name = TYPE_USB_AUDIO,
+-    .unmigratable = 1,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_USB_DEVICE(dev, USBAudioState),
++        {
++            .name = "audio-stream",
++            .info = &(const VMStateInfo) {
++                .name = "usb-audio-stream",
++                .get = usb_audio_saved_get,
++                .put = usb_audio_saved_put,
++            },
++            .flags = VMS_SINGLE,
++            .offset = 0,
++        },
++        VMSTATE_END_OF_LIST()
++    },
+ };
+ 
++
+ static const Property usb_audio_properties[] = {
+     DEFINE_AUDIO_PROPERTIES(USBAudioState, audio_be),
+     DEFINE_PROP_UINT32("debug", USBAudioState, debug, 0),
 diff --git a/tests/unit/test-apple-gfx-close.py b/tests/unit/test-apple-gfx-close.py
 index 824bd589d3..1ffe17e1b1 100644
 --- a/tests/unit/test-apple-gfx-close.py

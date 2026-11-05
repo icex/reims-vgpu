@@ -2021,3 +2021,31 @@ flag set. The co-author found a root disk without FileVault needs it.
 - The `manual` entries of `crates/reims-vgpu-window/features.md` that
   "Window mode" does not record as measured, the guest's input, capture
   and the system's hot keys among them.
+
+
+## Experimental disk-backed desktop save (2026-11-05; macOS gate pending)
+
+The best-release patch adds opt-in apple-gfx-pci `save-state=on`. The default
+migration blocker remains for devices without the opt-in. The source must be
+stopped outside guest S3. A MIG_EVENT_SETUP notifier completes library GPU
+suspension before the RAM migration thread starts, including GPU writebacks.
+The PCI VMState stores the GPU blob and the IOSurface mapper state. Incoming
+restore loads mapper mappings over restored RAM, accepts the GPU blob, then
+rebuilds the GPU in a VM change handler before resume_all_vcpus. Library-owned
+RvgBytes allocations are copied and freed with rvg_bytes_free; QEMU's incoming
+buffers use its allocator. Blob lengths are bounded before allocation.
+
+USB audio migration saves its USB protocol state, interface/channel selection,
+volume/mute and initialized pending PCM. Host voice handles are recreated.
+AppleSMC migration saves its command/status, partially read key and data cursor;
+immutable keys are reconstructed from the pinned machine configuration.
+
+A stopped64MiB machine, whose CPUs never ran and which had no graphics device,
+saved/exited/restored with USB audio plus a partially completed AppleSMC
+REV command. The restored command returned the same six emulated bytes; the
+process had no DRM descriptors. This qualifies only that emulated-device path.
+Four new mapper tests pass, including host-only byte reconstruction. The
+62 IOSurface fake-platform tests pass with test-threads=1; parallel log/call
+capture interference was retained separately. Full macOS/GPU save/restore,
+GPU pixels, application state, physical USB/audio and host-reboot restore
+remain unqualified. The installed daily build is unchanged by this candidate.

@@ -46,7 +46,7 @@ class Tests(unittest.TestCase):
             result=control.transition(Path(d),'pause');self.assertIn('window_error',result)
         self.assertEqual(guest.state,'paused')
     def host(self,initial):
-        host=helper.HostSleep.__new__(helper.HostSleep);host.run=Path('/unused');host.resume_after_host=False
+        host=helper.HostSleep.__new__(helper.HostSleep);host.run=Path('/unused');host.resume_after_host=False;host.saving=False
         host.release=MagicMock();host.inhibit=MagicMock()
         with patch.object(helper.control,'transition',side_effect=[{'before':initial,'after':'paused'},{'before':'paused','after':'running'}]) as action,patch.object(helper.legacy,'record'):
             host.prepare(True);host.release.assert_called_once()
@@ -56,7 +56,7 @@ class Tests(unittest.TestCase):
     def test_host_sleep_running(self):self.host('running')
     def test_host_sleep_preserves_x_pause(self):self.host('paused')
     def test_sleep_failure_releases_delay(self):
-        host=helper.HostSleep.__new__(helper.HostSleep);host.run=Path('/unused');host.release=MagicMock()
+        host=helper.HostSleep.__new__(helper.HostSleep);host.run=Path('/unused');host.saving=False;host.release=MagicMock()
         with patch.object(helper.control,'transition',side_effect=RuntimeError('QMP offline')),patch.object(helper.legacy,'notify'),patch.object(helper.legacy,'record'):
             host.prepare(True);host.release.assert_called_once()
 
