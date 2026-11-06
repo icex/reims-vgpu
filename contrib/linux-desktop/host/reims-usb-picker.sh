@@ -20,7 +20,7 @@ while read -r _ _ _ _ _ id _; do
 done < <(lsusb)
 
 items=(); ambiguous=()
-while read -r _ _ _ _ _ id name; do
+while read -r _ bus _ number _ id name; do
     id="${id,,}"
     [[ "${id}" == 1d6b:* || "${name}" =~ [Hh]ub$ ]] && continue
     # A device already redirected stays listed so it can be given back (detach is by slot).
@@ -28,20 +28,21 @@ while read -r _ _ _ _ _ id name; do
         [[ " ${ambiguous[*]} " == *" ${id} "* ]] || ambiguous+=("${id}")
         continue
     fi
+    label=$(python3 "$(dirname "${USB}")/usb-device-info.py" "${bus}" "${number%:}" "${name:-${id}}") || label="${name:-${id}}"
     state=off; [[ -n "${attached[${id}]:-}" ]] && state=on
-    items+=("${id}" "${name:-${id}} (${id})" "${state}")
+    items+=("${id}" "${label} (${id})" "${state}")
 done < <(lsusb)
 (( ${#ambiguous[@]} )) && notify "Not offered: more than one attached device has ID ${ambiguous[*]}."
 (( ${#items[@]} )) || { notify "No USB devices to pass to macOS."; exit 0; }
 
 if command -v kdialog >/dev/null; then
     chosen=$(kdialog --title "${TITLE}" --separate-output \
-        --checklist "USB devices used by macOS (at most two):" "${items[@]}") || exit 0
+        --checklist "Select the USB storage device to mount a drive in macOS (at most two devices):" "${items[@]}") || exit 0
 elif command -v zenity >/dev/null; then
     args=(); for ((i=0; i<${#items[@]}; i+=3)); do
         args+=("$([[ ${items[i+2]} == on ]] && echo TRUE || echo FALSE)" "${items[i]}" "${items[i+1]}")
     done
-    chosen=$(zenity --list --checklist --title "${TITLE}" --text "USB devices used by macOS (at most two):" \
+    chosen=$(zenity --list --checklist --title "${TITLE}" --text "Select the USB storage device to mount a drive in macOS (at most two devices):" \
         --column Use --column ID --column Device --separator=$'\n' "${args[@]}") || exit 0
 else
     notify "Neither kdialog nor zenity is installed: cannot show the USB picker."

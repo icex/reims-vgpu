@@ -45,7 +45,8 @@ case "${1:-status}" in
             echo "${#matches[@]} host devices match ${device} (bus/device ${matches[*]}); refusing to pick one" >&2; exit 1; }
         bus_dev="${matches[0]}"
         [[ -w "/dev/bus/usb/${bus_dev}" ]] || {
-            echo "no write access to /dev/bus/usb/${bus_dev}; see the udev note in $0" >&2; exit 1; }
+            label=$(python3 "$(dirname "${BRIDGE}")/usb-device-info.py" "${bus_dev%/*}" "${bus_dev#*/}" "${device}") || label="${device}"
+            echo "${label} (${device}) needs permission for /dev/bus/usb/${bus_dev}. For a drive, select the USB storage entry; see the udev note in $0 for other devices." >&2; exit 1; }
         [[ -S "$(slot_socket "${slot}")" ]] || {
             echo "no usb-redir slot at $(slot_socket "${slot}") (is the VM running with CONSOLE_USBREDIR=on?)" >&2; exit 1; }
         systemctl --user reset-failed "$(unit "${slot}")" 2>/dev/null || true

@@ -163,3 +163,10 @@ No GPU fault suite or performance qualification covers these helpers. Launcher
 settings, VM disks, firmware images, guest binaries/shaders, account setup,
 passwords, SSH keys, machine-specific configuration, screenshots and raw runtime
 logs are not part of this directory.
+
+
+The USB picker labels storage and Bluetooth adapters using their sysfs interface
+classes and product strings. A permission failure for another selected device
+is independent of a successfully redirected drive. Forwarding a drive does not
+mean its filesystem has finished mounting: APFS may validate checkpoints before
+Finder can use a backup volume. Avoid disconnecting a drive during that check.
