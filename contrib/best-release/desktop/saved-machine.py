@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import runpy
 import stat
+import subprocess
 import time
 import uuid
 
@@ -51,8 +52,32 @@ def identity(path):
     info = path.stat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
         raise RuntimeError('Saved-machine disk is not an owned regular file: ' + str(path))
-    return dict(path=str(path), device=info.st_dev, inode=info.st_ino,
-                size=info.st_size, mtime_ns=info.st_mtime_ns)
+    result = dict(path=str(path), device=info.st_dev, inode=info.st_ino,
+                  size=info.st_size, mtime_ns=info.st_mtime_ns)
+    # Btrfs anonymous device numbers are allocated anew at mount/boot.
+    filesystem = subprocess.check_output(
+        ['findmnt', '-n', '-o', 'UUID', '-T', str(path)], text=True).strip()
+    if filesystem:
+        result['filesystem_uuid'] = filesystem
+    return result
+
+
+def disk_matches(expected, current, source_identity):
+    expected, current = dict(expected), dict(current)
+    if 'filesystem_uuid' in expected:
+        if expected['filesystem_uuid'] != current.get('filesystem_uuid'):
+            return False
+        expected.pop('device', None)
+        current.pop('device', None)
+    else:
+        # Legacy manifests predate filesystem UUIDs. Only tolerate renumbering
+        # after a proven boot change; all path/inode/size/mtime guards remain.
+        current.pop('filesystem_uuid', None)
+        old_boot = (source_identity or {}).get('boot_id')
+        if old_boot and old_boot != Path('/proc/sys/kernel/random/boot_id').read_text().strip():
+            expected.pop('device', None)
+            current.pop('device', None)
+    return expected == current
 
 
 def base_command(args):
@@ -134,7 +159,7 @@ def validate_restore(run, args):
     if digest(args[0]) != manifest['qemu_sha256']:
         raise RuntimeError('The saved machine requires its exact QEMU build.')
     for disk in manifest['disks']:
-        if identity(disk['path']) != disk:
+        if not disk_matches(disk, identity(disk['path']), manifest.get('source_identity')):
             raise RuntimeError('A saved-machine disk changed: ' + disk['path'])
     image = image_path(run, manifest)
     if image.stat().st_size != manifest['image_size'] or digest(image) != manifest['image_sha256']:

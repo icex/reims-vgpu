@@ -58,6 +58,24 @@ class Tests(unittest.TestCase):
     def test_changed_disk_refuses_restore(self):
         self.save();self.disk.write_bytes(b'changed guest disk')
         with self.assertRaisesRegex(RuntimeError,'disk changed'):m.validate_restore(self.run,self.args)
+    def test_filesystem_device_renumbering_across_boot(self):
+        expected = dict(path='/vm/disk', device=46, inode=12, size=100,
+                        mtime_ns=123, filesystem_uuid='stable-filesystem')
+        current = dict(expected, device=44)
+        self.assertTrue(m.disk_matches(expected, current, None))
+        self.assertFalse(m.disk_matches(expected, dict(current, filesystem_uuid='other'), None))
+        for field in ('inode', 'size', 'mtime_ns'):
+            self.assertFalse(m.disk_matches(expected, dict(current, **{field: 999}), None))
+
+    def test_legacy_device_renumbering_requires_new_boot(self):
+        expected = dict(path='/vm/disk', device=46, inode=12, size=100, mtime_ns=123)
+        current = dict(expected, device=44, filesystem_uuid='stable-filesystem')
+        self.assertFalse(m.disk_matches(expected, current, None))
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        self.assertFalse(m.disk_matches(expected, current, {'boot_id': boot}))
+        self.assertTrue(m.disk_matches(expected, current, {'boot_id': 'previous-boot'}))
+        self.assertFalse(m.disk_matches(expected, dict(current, size=101), {'boot_id': 'previous-boot'}))
+
     def test_changed_build_refuses_restore(self):
         self.save();self.exe.write_bytes(b'another QEMU build')
         with self.assertRaisesRegex(RuntimeError,'exact QEMU build'):m.validate_restore(self.run,self.args)
