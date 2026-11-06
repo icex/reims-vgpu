@@ -1,4 +1,4 @@
 [submodule "vendor/qemu"]
 	path = vendor/qemu
 	url = https://github.com/icex/qemu-reims-vgpu
-	branch = reims-best-20261103
+	branch = desktop-sleep-resume
